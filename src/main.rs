@@ -18,6 +18,13 @@ use macroquad::prelude::*;
 use macroquad::rand::{gen_range, srand};
 use std::collections::VecDeque;
 
+mod net;
+use net::{
+    dequant_angle, quant_angle, ClientNet, ClientState, DroneBlob, HostClient, HostNet, Packet,
+    PickupBlob, PlayerBlob, ProjBlob, Snapshot, TurretBlob, DEFAULT_PORT, MAX_PLAYERS, PF_ALIVE,
+    PF_DASH, PF_OVERDRIVE, VER,
+};
+
 // ---------------------------------------------------------------- constants
 
 const CELL: f32 = 2.0;
@@ -765,6 +772,7 @@ enum DroneState {
 }
 
 struct Drone {
+    id: u8,
     pos: Vec2,
     dir: Vec2,
     state: DroneState,
@@ -781,8 +789,9 @@ struct Drone {
 }
 
 impl Drone {
-    fn new(pos: Vec2) -> Drone {
+    fn new(pos: Vec2, id: u8) -> Drone {
         Drone {
+            id,
             pos,
             dir: vec2(1.0, 0.0),
             state: DroneState::Patrol,
@@ -875,6 +884,68 @@ struct LightSrc {
     intensity: f32,
 }
 
+/// Another player in a co-op session. On the host this mirrors what clients
+/// report (position is client-authoritative, health/damage host-authoritative);
+/// on a client it is rebuilt from snapshots and interpolated for rendering.
+struct RemotePlayer {
+    id: u8,
+    pos: Vec2,
+    render_pos: Vec2,
+    vel: Vec2,
+    yaw: f32,
+    render_yaw: f32,
+    pitch: f32,
+    hp: f32,
+    alive: bool,
+    respawn_t: f32,
+    dashing: bool,
+    overdrive: bool,
+    overdrive_t: f32,
+    invuln: f32,
+    combo: f32,
+    combo_t: f32,
+    hurt_ctr: u8,
+    hurt_dir: u8,
+    shot_ctr: u8,
+    anim_t: f32,
+}
+
+impl RemotePlayer {
+    fn new(id: u8, pos: Vec2) -> RemotePlayer {
+        RemotePlayer {
+            id,
+            pos,
+            render_pos: pos,
+            vel: Vec2::ZERO,
+            yaw: 0.0,
+            render_yaw: 0.0,
+            pitch: 0.0,
+            hp: 100.0,
+            alive: true,
+            respawn_t: 0.0,
+            dashing: false,
+            overdrive: false,
+            overdrive_t: 0.0,
+            invuln: 0.0,
+            combo: 1.0,
+            combo_t: 0.0,
+            hurt_ctr: 0,
+            hurt_dir: 0,
+            shot_ctr: 0,
+            anim_t: 0.0,
+        }
+    }
+}
+
+fn player_color(id: u8) -> Color {
+    match id % 4 {
+        0 => Color::new(0.30, 0.95, 1.00, 1.0),
+        1 => Color::new(1.00, 0.62, 0.18, 1.0),
+        2 => Color::new(0.35, 1.00, 0.50, 1.0),
+        _ => Color::new(1.00, 0.90, 0.30, 1.0),
+    }
+}
+
 // --------------------------------------------------------------------- game
 
 struct Game {
@@ -926,6 +997,22 @@ struct Game {
     stats: RunStats,
     cam_matrix: Mat4,
     pending_hitstop: f32,
+    // --- multiplayer
+    mp: bool,
+    net_client: bool,
+    my_id: u8,
+    remotes: Vec<RemotePlayer>,
+    next_drone_id: u8,
+    my_shot_ctr: u8,
+    my_hurt_ctr: u8,
+    my_hurt_dir: u8,
+    my_respawn_t: f32,
+    kill_ctr: u8,
+    last_kill: (Vec2, bool),
+    level_seed: u64,
+    net_phase: u8,
+    net_status: String,
+    client_shot_request: Option<(Vec3, Vec3)>,
 }
 
 fn build_world_meshes(maze: &Maze) -> (Vec<(Vec2, f32, Mesh)>, Mesh) {
@@ -1016,7 +1103,10 @@ impl Game {
         (16.0 + self.level as f32 * 1.5).min(30.0)
     }
 
-    fn new(level: u32, score: i64, hp: f32, stats: RunStats) -> Game {
+    /// Build a level. Generation is fully determined by `seed`, so a host and
+    /// its clients construct identical worlds from the snapshot header alone.
+    fn new(level: u32, score: i64, hp: f32, stats: RunStats, seed: u64) -> Game {
+        srand(seed);
         let n = (13 + 2 * level as usize).min(27);
         let maze = Maze::generate(n);
         let spawn_cell = (1, 1);
@@ -1051,8 +1141,10 @@ impl Game {
         let drones: Vec<Drone> = dcells
             .iter()
             .take(n_drones)
-            .map(|&(x, y)| Drone::new(maze.cell_center(x, y)))
+            .enumerate()
+            .map(|(i, &(x, y))| Drone::new(maze.cell_center(x, y), i as u8 + 1))
             .collect();
+        let next_drone_id = drones.len() as u8 + 1;
 
         // Turrets from level 3.
         let n_turrets = if level >= 3 { ((level - 2) as usize).min(5) } else { 0 };
@@ -1116,6 +1208,10 @@ impl Game {
         let yaw = if !maze.is_wall(2, 1) { 0.0 } else { std::f32::consts::FRAC_PI_2 };
         let total = crystals.len();
 
+        // Decouple gameplay randomness from generation (still deterministic
+        // per seed so the screenshot self-tests stay reproducible).
+        srand(seed ^ 0x9E37_79B9_7F4A_7C15);
+
         Game {
             level,
             score,
@@ -1165,6 +1261,53 @@ impl Game {
             stats,
             cam_matrix: Mat4::IDENTITY,
             pending_hitstop: 0.0,
+            mp: false,
+            net_client: false,
+            my_id: 0,
+            remotes: Vec::new(),
+            next_drone_id,
+            my_shot_ctr: 0,
+            my_hurt_ctr: 0,
+            my_hurt_dir: 0,
+            my_respawn_t: 0.0,
+            kill_ctr: 0,
+            last_kill: (Vec2::ZERO, false),
+            level_seed: seed,
+            net_phase: 0,
+            net_status: String::new(),
+            client_shot_request: None,
+        }
+    }
+
+    /// Open cell for player slot `i` (0 = host), nearest the maze origin.
+    fn spawn_pos(&self, slot: usize) -> Vec2 {
+        let mut cells = self.maze.open_cells();
+        cells.sort_by_key(|&(x, y)| (x - 1).abs() + (y - 1).abs());
+        let (x, y) = cells[slot.min(cells.len() - 1)];
+        self.maze.cell_center(x, y)
+    }
+
+    /// Carry the network session into a freshly generated level.
+    fn adopt_net(&mut self, prev: &mut Game) {
+        self.mp = prev.mp;
+        self.net_client = prev.net_client;
+        self.my_id = prev.my_id;
+        self.my_shot_ctr = prev.my_shot_ctr;
+        self.my_hurt_ctr = prev.my_hurt_ctr;
+        self.kill_ctr = prev.kill_ctr;
+        self.net_status = std::mem::take(&mut prev.net_status);
+        self.remotes = std::mem::take(&mut prev.remotes);
+        for i in 0..self.remotes.len() {
+            let sp = self.spawn_pos(i + 1);
+            let r = &mut self.remotes[i];
+            r.pos = sp;
+            r.render_pos = sp;
+            r.alive = true;
+            r.respawn_t = 0.0;
+            r.hp = r.hp.clamp(70.0, 100.0);
+            r.invuln = 2.5;
+            r.overdrive_t = 0.0;
+            r.overdrive = false;
         }
     }
 
@@ -1222,14 +1365,9 @@ impl Game {
         self.eye() + f * 0.55 + r * 0.16 + u * -0.12
     }
 
-    fn shoot(&mut self, snd: &Option<Sounds>) {
-        self.shot_cd = self.fire_cd();
-        self.recoil = (self.recoil + 0.022).min(0.05);
-        self.muzzle_flash = 1.0;
-        play(snd, |s| &s.shoot, 0.5);
-        let eye = self.eye();
-        let dir = self.look_dir();
-
+    /// Ray-march the maze and sphere-test drones / turret heads.
+    /// Returns (wall distance, nearest target as (index, t, is_turret)).
+    fn scan_targets(&self, eye: Vec3, dir: Vec3) -> (f32, Option<(usize, f32, bool)>) {
         let mut wall_t = SHOT_RANGE;
         let mut t = 0.3;
         while t < SHOT_RANGE {
@@ -1248,7 +1386,6 @@ impl Game {
             t += 0.15;
         }
 
-        // Nearest target (drone or turret head) before the wall.
         let gt = get_time() as f32;
         let mut best: Option<(usize, f32, bool)> = None; // idx, t, is_turret
         for (i, d) in self.drones.iter().enumerate() {
@@ -1280,39 +1417,112 @@ impl Game {
                 }
             }
         }
+        (wall_t, best)
+    }
 
-        let muzzle = self.muzzle_world();
-        let hit_t = best.map_or(wall_t, |(_, t, _)| t);
-        let hit_p = eye + dir * hit_t;
-        self.tracers.push(Tracer { from: muzzle, to: hit_p, ttl: 0.06 });
-
-        // Shots alert nearby drones.
-        let ppos = self.ppos;
+    fn alert_drones(&mut self, from: Vec2) {
         for d in self.drones.iter_mut() {
-            if (d.pos - ppos).length() < 9.0 && d.state != DroneState::Chase {
+            if (d.pos - from).length() < 9.0 && d.state != DroneState::Chase {
                 d.state = DroneState::Chase;
-                d.last_seen = ppos;
+                d.last_seen = from;
                 d.repath_t = 0.0;
                 d.lost_t = 0.0;
             }
         }
+    }
 
+    fn shoot(&mut self, snd: &Option<Sounds>) {
+        self.shot_cd = self.fire_cd();
+        self.recoil = (self.recoil + 0.022).min(0.05);
+        self.muzzle_flash = 1.0;
+        self.my_shot_ctr = self.my_shot_ctr.wrapping_add(1);
+        play(snd, |s| &s.shoot, 0.5);
+        let eye = self.eye();
+        let dir = self.look_dir();
+        let muzzle = self.muzzle_world();
+
+        let (wall_t, best) = self.scan_targets(eye, dir);
+        let hit_t = best.map_or(wall_t, |(_, t, _)| t);
+        let hit_p = eye + dir * hit_t;
+        self.tracers.push(Tracer { from: muzzle, to: hit_p, ttl: 0.06 });
+
+        if self.net_client {
+            // Cosmetic prediction only — the host resolves damage from the
+            // queued shot event (drained by the main loop into the socket).
+            if best.is_some() {
+                self.hitmark_t = 0.12;
+            }
+            self.client_shot_request = Some((eye, dir));
+            return;
+        }
+
+        self.alert_drones(self.ppos);
+        self.apply_shot_damage(best, hit_p, None, snd);
+    }
+
+    /// Host-side: a client's shot arrived over the network.
+    fn remote_shot(&mut self, ri: usize, origin: Vec3, dir: Vec3, snd: &Option<Sounds>) {
+        let rp = self.remotes[ri].pos;
+        // Sanity-clamp the reported origin to the player it came from.
+        let origin = if (vec2(origin.x, origin.z) - rp).length() > 2.5 {
+            vec3(rp.x, EYE_H, rp.y)
+        } else {
+            origin
+        };
+        let dir = dir.normalize_or_zero();
+        if dir == Vec3::ZERO {
+            return;
+        }
+        self.remotes[ri].shot_ctr = self.remotes[ri].shot_ctr.wrapping_add(1);
+        let (wall_t, best) = self.scan_targets(origin, dir);
+        let hit_t = best.map_or(wall_t, |(_, t, _)| t);
+        let hit_p = origin + dir * hit_t;
+        self.tracers.push(Tracer { from: origin + dir * 0.4, to: hit_p, ttl: 0.06 });
+        let vol = (1.0 - (rp - self.ppos).length() / 22.0).clamp(0.05, 0.5);
+        play(snd, |s| &s.shoot, vol);
+        self.alert_drones(rp);
+        self.apply_shot_damage(best, hit_p, Some(ri), snd);
+    }
+
+    fn apply_shot_damage(
+        &mut self,
+        best: Option<(usize, f32, bool)>,
+        hit_p: Vec3,
+        shooter: Option<usize>, // None = local player, Some = remotes index
+        snd: &Option<Sounds>,
+    ) {
+        let local = shooter.is_none();
+        let combo = match shooter {
+            None => self.combo,
+            Some(ri) => self.remotes[ri].combo,
+        };
+        let shooter_pos = match shooter {
+            None => self.ppos,
+            Some(ri) => self.remotes[ri].pos,
+        };
         match best {
             Some((i, _, false)) => {
                 self.drones[i].hp -= 1;
                 self.drones[i].hit_flash = 1.0;
                 self.drones[i].state = DroneState::Chase;
-                self.drones[i].last_seen = ppos;
+                self.drones[i].last_seen = shooter_pos;
                 self.drones[i].lost_t = 0.0;
-                let push = vec2(dir.x, dir.z).normalize_or_zero() * 0.25;
+                let push = (self.drones[i].pos - shooter_pos).normalize_or_zero() * 0.25;
                 self.drones[i].pos = self.maze.resolve(self.drones[i].pos + push, DRONE_R);
-                self.hitmark_t = 0.12;
+                if local {
+                    self.hitmark_t = 0.12;
+                }
                 if self.drones[i].hp <= 0 {
                     let d = self.drones.remove(i);
-                    let kill = ((50 * self.level as i64 + 100) as f32 * self.combo) as i64;
+                    let kill = ((50 * self.level as i64 + 100) as f32 * combo) as i64;
                     self.score += kill;
                     self.stats.kills += 1;
-                    self.combo_t = 6.0;
+                    match shooter {
+                        None => self.combo_t = 6.0,
+                        Some(ri) => self.remotes[ri].combo_t = 6.0,
+                    }
+                    self.kill_ctr = self.kill_ctr.wrapping_add(1);
+                    self.last_kill = (d.pos, false);
                     let kp = vec3(d.pos.x, 0.9, d.pos.y);
                     self.world_popups.push(WorldPopup {
                         pos: kp,
@@ -1322,9 +1532,14 @@ impl Game {
                     self.burst(kp, Color::new(1.0, 0.4, 0.15, 1.0), 26, 6.0);
                     self.explosions.push(Explosion { pos: kp, t: 0.0, big: false });
                     self.respawns.push(DRONE_RESPAWN);
-                    self.pending_hitstop = 0.07;
-                    self.shake = (self.shake + 0.25).min(1.0);
-                    play(snd, |s| &s.kill, 0.6);
+                    let vol = if local {
+                        self.pending_hitstop = 0.07;
+                        self.shake = (self.shake + 0.25).min(1.0);
+                        0.6
+                    } else {
+                        (1.0 - (d.pos - self.ppos).length() / 24.0).clamp(0.1, 0.6)
+                    };
+                    play(snd, |s| &s.kill, vol);
                 } else {
                     let d = &self.drones[i];
                     self.burst(vec3(d.pos.x, 0.9, d.pos.y), Color::new(1.0, 0.8, 0.4, 1.0), 6, 3.5);
@@ -1333,14 +1548,22 @@ impl Game {
             Some((i, _, true)) => {
                 self.turrets[i].hp -= 1;
                 self.turrets[i].hit_flash = 1.0;
-                self.hitmark_t = 0.12;
+                if local {
+                    self.hitmark_t = 0.12;
+                }
                 if self.turrets[i].hp <= 0 {
                     self.turrets[i].alive = false;
-                    let kill = ((50 * self.level as i64 + 200) as f32 * self.combo) as i64;
+                    let kill = ((50 * self.level as i64 + 200) as f32 * combo) as i64;
                     self.score += kill;
                     self.stats.turrets += 1;
-                    self.combo_t = 6.0;
-                    let kp = vec3(self.turrets[i].pos.x, 1.0, self.turrets[i].pos.y);
+                    match shooter {
+                        None => self.combo_t = 6.0,
+                        Some(ri) => self.remotes[ri].combo_t = 6.0,
+                    }
+                    let tpos = self.turrets[i].pos;
+                    self.kill_ctr = self.kill_ctr.wrapping_add(1);
+                    self.last_kill = (tpos, true);
+                    let kp = vec3(tpos.x, 1.0, tpos.y);
                     self.world_popups.push(WorldPopup {
                         pos: kp,
                         text: format!("+{}", kill),
@@ -1348,9 +1571,14 @@ impl Game {
                     });
                     self.burst(kp, Color::new(1.0, 0.3, 0.8, 1.0), 34, 7.0);
                     self.explosions.push(Explosion { pos: kp, t: 0.0, big: true });
-                    self.pending_hitstop = 0.09;
-                    self.shake = (self.shake + 0.4).min(1.0);
-                    play(snd, |s| &s.kill, 0.8);
+                    let vol = if local {
+                        self.pending_hitstop = 0.09;
+                        self.shake = (self.shake + 0.4).min(1.0);
+                        0.8
+                    } else {
+                        (1.0 - (tpos - self.ppos).length() / 24.0).clamp(0.1, 0.8)
+                    };
+                    play(snd, |s| &s.kill, vol);
                 } else {
                     let p = self.turrets[i].pos;
                     self.burst(vec3(p.x, 1.05, p.y), Color::new(1.0, 0.5, 0.9, 1.0), 6, 3.5);
@@ -1363,7 +1591,12 @@ impl Game {
     }
 
     fn hurt(&mut self, dmg: f32, from_dir: Vec2, snd: &Option<Sounds>) {
+        if self.my_respawn_t > 0.0 {
+            return;
+        }
         self.hp -= dmg;
+        self.my_hurt_ctr = self.my_hurt_ctr.wrapping_add(1);
+        self.my_hurt_dir = quant_angle(from_dir.y.atan2(from_dir.x));
         self.invuln = 1.2;
         self.dmg_flash = 1.0;
         self.shake = (self.shake + 0.6).min(1.2);
@@ -1374,9 +1607,45 @@ impl Game {
         play(snd, |s| &s.hurt, 0.7);
     }
 
+    /// Host-side damage to a co-op partner.
+    fn remote_hurt(&mut self, ri: usize, dmg: f32, from_dir: Vec2, snd: &Option<Sounds>) {
+        {
+            let r = &mut self.remotes[ri];
+            if !r.alive || r.invuln > 0.0 || r.dashing {
+                return;
+            }
+            r.hp -= dmg;
+            r.invuln = 1.2;
+            r.hurt_ctr = r.hurt_ctr.wrapping_add(1);
+            r.hurt_dir = quant_angle(from_dir.y.atan2(from_dir.x));
+        }
+        let rp = self.remotes[ri].pos;
+        let p = rp + from_dir * 0.5;
+        self.burst(vec3(p.x, 0.8, p.y), Color::new(1.0, 0.2, 0.2, 1.0), 10, 4.0);
+        let vol = (1.0 - (rp - self.ppos).length() / 22.0).clamp(0.05, 0.4);
+        play(snd, |s| &s.hurt, vol);
+        if self.remotes[ri].hp <= 0.0 {
+            let id = self.remotes[ri].id;
+            {
+                let r = &mut self.remotes[ri];
+                r.hp = 0.0;
+                r.alive = false;
+                r.respawn_t = 5.0;
+            }
+            self.burst(vec3(rp.x, 0.9, rp.y), Color::new(1.0, 0.25, 0.2, 1.0), 24, 5.5);
+            self.world_popups.push(WorldPopup {
+                pos: vec3(rp.x, 1.4, rp.y),
+                text: format!("P{} DOWN", id as u32 + 1),
+                t: 1.6,
+            });
+            play(snd, |s| &s.death, 0.45);
+        }
+    }
+
     /// Per-frame simulation.
     fn update(&mut self, dt: f32, active: bool, input: bool, snd: &Option<Sounds>) {
         let t = get_time() as f32;
+        let input = input && self.my_respawn_t <= 0.0; // no control while down
         if active {
             self.time_in_level += dt;
         }
@@ -1512,66 +1781,116 @@ impl Game {
             self.last_hit_dir = if ttl > 0.0 { Some((a, ttl)) } else { None };
         }
 
-        // ----- crystals (with magnet)
-        if active {
-            let ppos = self.ppos;
-            let mut collected: Vec<Vec3> = Vec::new();
+        // ----- crystals + pickups (host / single-player authority).
+        // Any living player collects; the magnet pulls toward the nearest.
+        if active && !self.net_client {
+            let mut takers: Vec<(usize, Vec2)> = Vec::new(); // usize::MAX = local
+            if self.my_respawn_t <= 0.0 {
+                takers.push((usize::MAX, self.ppos));
+            }
+            for (i, r) in self.remotes.iter().enumerate() {
+                if r.alive {
+                    takers.push((i, r.pos));
+                }
+            }
+
+            let mut collected: Vec<(Vec3, usize)> = Vec::new();
             for c in self.crystals.iter_mut() {
                 if c.taken {
                     continue;
                 }
-                let d = ppos - c.pos;
-                let dist = d.length();
-                if dist < 2.8 && dist > 0.01 {
-                    c.pos += d / dist * (6.5 * (1.0 - dist / 2.8) + 1.5) * dt;
+                let mut near: Option<(usize, Vec2, f32)> = None;
+                for &(ri, tp) in &takers {
+                    let dd = (tp - c.pos).length();
+                    if near.map_or(true, |(_, _, bd)| dd < bd) {
+                        near = Some((ri, tp, dd));
+                    }
                 }
-                if dist < 0.9 {
-                    c.taken = true;
-                    collected.push(vec3(c.pos.x, 1.0, c.pos.y));
+                if let Some((ri, tp, dist)) = near {
+                    if dist < 2.8 && dist > 0.01 {
+                        c.pos += (tp - c.pos) / dist * (6.5 * (1.0 - dist / 2.8) + 1.5) * dt;
+                    }
+                    if dist < 0.9 {
+                        c.taken = true;
+                        collected.push((vec3(c.pos.x, 1.0, c.pos.y), ri));
+                    }
                 }
             }
-            for pos in collected {
-                let pts = ((100 + 25 * (self.level as i64 - 1)) as f32 * self.combo) as i64;
+            for (pos, ri) in collected {
+                let combo = if ri == usize::MAX { self.combo } else { self.remotes[ri].combo };
+                let pts = ((100 + 25 * (self.level as i64 - 1)) as f32 * combo) as i64;
                 self.score += pts;
                 self.stats.crystals += 1;
-                self.hp = (self.hp + 4.0).min(100.0);
-                self.pick_flash = 1.0;
-                self.combo = (self.combo + 1.0).min(6.0);
-                self.combo_t = 6.0;
-                self.popup(format!("+{} CRYSTAL", pts));
+                if ri == usize::MAX {
+                    self.hp = (self.hp + 4.0).min(100.0);
+                    self.pick_flash = 1.0;
+                    self.combo = (self.combo + 1.0).min(6.0);
+                    self.combo_t = 6.0;
+                    self.popup(format!("+{} CRYSTAL", pts));
+                    play(snd, |s| &s.pickup, 0.65);
+                } else {
+                    let r = &mut self.remotes[ri];
+                    r.hp = (r.hp + 4.0).min(100.0);
+                    r.combo = (r.combo + 1.0).min(6.0);
+                    r.combo_t = 6.0;
+                    let vol = (1.0 - (vec2(pos.x, pos.z) - self.ppos).length() / 22.0)
+                        .clamp(0.05, 0.45);
+                    play(snd, |s| &s.pickup, vol);
+                }
                 self.burst(pos, COL_CRYSTAL, 22, 5.0);
-                play(snd, |s| &s.pickup, 0.65);
             }
 
             // Pickups.
-            let mut got: Vec<(PickupKind, Vec3)> = Vec::new();
+            let mut got: Vec<(PickupKind, Vec3, usize)> = Vec::new();
             for p in self.pickups.iter_mut() {
                 if p.taken {
                     continue;
                 }
-                let d = ppos - p.pos;
-                let dist = d.length();
-                if dist < 2.4 && dist > 0.01 {
-                    p.pos += d / dist * (5.0 * (1.0 - dist / 2.4) + 1.0) * dt;
+                let mut near: Option<(usize, Vec2, f32)> = None;
+                for &(ri, tp) in &takers {
+                    let dd = (tp - p.pos).length();
+                    if near.map_or(true, |(_, _, bd)| dd < bd) {
+                        near = Some((ri, tp, dd));
+                    }
                 }
-                if dist < 0.9 {
-                    p.taken = true;
-                    got.push((p.kind, vec3(p.pos.x, 0.8, p.pos.y)));
+                if let Some((ri, tp, dist)) = near {
+                    if dist < 2.4 && dist > 0.01 {
+                        p.pos += (tp - p.pos) / dist * (5.0 * (1.0 - dist / 2.4) + 1.0) * dt;
+                    }
+                    if dist < 0.9 {
+                        p.taken = true;
+                        got.push((p.kind, vec3(p.pos.x, 0.8, p.pos.y), ri));
+                    }
                 }
             }
-            for (kind, pos) in got {
+            for (kind, pos, ri) in got {
+                let vol = (1.0 - (vec2(pos.x, pos.z) - self.ppos).length() / 22.0)
+                    .clamp(0.05, 0.5);
                 match kind {
                     PickupKind::Health => {
-                        self.hp = (self.hp + 30.0).min(100.0);
-                        self.popup("+30 HP".to_string());
+                        if ri == usize::MAX {
+                            self.hp = (self.hp + 30.0).min(100.0);
+                            self.popup("+30 HP".to_string());
+                            play(snd, |s| &s.health, 0.7);
+                        } else {
+                            let r = &mut self.remotes[ri];
+                            r.hp = (r.hp + 30.0).min(100.0);
+                            play(snd, |s| &s.health, vol);
+                        }
                         self.burst(pos, GREEN, 18, 4.5);
-                        play(snd, |s| &s.health, 0.7);
                     }
                     PickupKind::Overdrive => {
-                        self.overdrive_t = 8.0;
-                        self.popup("OVERDRIVE".to_string());
+                        if ri == usize::MAX {
+                            self.overdrive_t = 8.0;
+                            self.popup("OVERDRIVE".to_string());
+                            play(snd, |s| &s.pickup, 0.8);
+                        } else {
+                            let r = &mut self.remotes[ri];
+                            r.overdrive_t = 8.0;
+                            r.overdrive = true;
+                            play(snd, |s| &s.pickup, vol);
+                        }
                         self.burst(pos, COL_OVERDRIVE, 24, 5.5);
-                        play(snd, |s| &s.pickup, 0.8);
                     }
                 }
             }
@@ -1598,26 +1917,46 @@ impl Game {
         }
         self.particles.append(&mut sparkles);
 
-        // ----- drones
+        // ----- enemies + co-op respawns (host / single-player authority)
+        if !self.net_client {
         let chase_speed = self.drone_chase_speed();
         let sight = self.drone_sight();
         let damage = self.drone_damage();
         let ppos = self.ppos;
         let maze = &self.maze;
-        let mut hit_player: Option<Vec2> = None;
+        // (remote index, pos, vel, vulnerable); usize::MAX = the local player.
+        let mut targets: Vec<(usize, Vec2, Vec2, bool)> = Vec::new();
+        if active {
+            if self.my_respawn_t <= 0.0 {
+                targets.push((usize::MAX, self.ppos, self.vel, self.invuln <= 0.0));
+            }
+            for (i, r) in self.remotes.iter().enumerate() {
+                if r.alive {
+                    targets.push((i, r.pos, r.vel, r.invuln <= 0.0 && !r.dashing));
+                }
+            }
+        }
+        let mut contact_hits: Vec<(usize, Vec2)> = Vec::new();
 
         for d in self.drones.iter_mut() {
             d.hit_flash = (d.hit_flash - dt * 6.0).max(0.0);
-            let to_player = ppos - d.pos;
-            let dist = to_player.length();
-            let sees = active && dist < sight && maze.los(d.pos, ppos);
+            // Nearest visible player (local or remote).
+            let mut seen: Option<(Vec2, f32)> = None;
+            for &(_, tpos, _, _) in &targets {
+                let dd = (tpos - d.pos).length();
+                if dd < sight && seen.map_or(true, |(_, bd)| dd < bd) && maze.los(d.pos, tpos) {
+                    seen = Some((tpos, dd));
+                }
+            }
+            let sees = seen.is_some();
+            let seen_pos = seen.map_or(ppos, |(p, _)| p);
             let my_cell = maze.world_to_cell(d.pos);
 
             match d.state {
                 DroneState::Patrol => {
                     if sees {
                         d.state = DroneState::Chase;
-                        d.last_seen = ppos;
+                        d.last_seen = seen_pos;
                         d.lost_t = 0.0;
                         d.repath_t = 0.0;
                     } else if d.path_i >= d.path.len() {
@@ -1636,12 +1975,12 @@ impl Game {
                 }
                 DroneState::Chase => {
                     if sees {
-                        d.last_seen = ppos;
+                        d.last_seen = seen_pos;
                         d.lost_t = 0.0;
                     } else {
                         d.lost_t += dt;
                     }
-                    if !active || d.lost_t > 3.5 {
+                    if targets.is_empty() || d.lost_t > 3.5 {
                         d.state = DroneState::Investigate;
                         d.investigate_t = 1.2;
                         d.path.clear();
@@ -1651,7 +1990,7 @@ impl Game {
                 DroneState::Investigate => {
                     if sees {
                         d.state = DroneState::Chase;
-                        d.last_seen = ppos;
+                        d.last_seen = seen_pos;
                         d.lost_t = 0.0;
                         d.repath_t = 0.0;
                     } else {
@@ -1678,7 +2017,7 @@ impl Game {
                 }
                 DroneState::Chase => {
                     if sees {
-                        (chase_speed, ppos)
+                        (chase_speed, seen_pos)
                     } else {
                         // Path toward last seen position.
                         d.repath_t -= dt;
@@ -1738,8 +2077,10 @@ impl Game {
                 d.repath_t = 0.0;
             }
 
-            if active && self.invuln <= 0.0 && dist < PLAYER_R + DRONE_R + 0.05 {
-                hit_player = Some(to_player.normalize_or_zero());
+            for &(ri, tpos, _, vuln) in &targets {
+                if vuln && (tpos - d.pos).length() < PLAYER_R + DRONE_R + 0.05 {
+                    contact_hits.push((ri, (tpos - d.pos).normalize_or_zero()));
+                }
             }
         }
 
@@ -1764,16 +2105,26 @@ impl Game {
             if !tr.alive {
                 continue;
             }
-            let to_p = ppos - tr.pos;
-            let dist = to_p.length();
-            if active && dist < 15.0 && dist > 0.5 && maze.los(tr.pos, ppos) {
-                let want = to_p / dist;
+            // Track the nearest visible player.
+            let mut tgt: Option<(Vec2, Vec2, f32)> = None;
+            for &(_, tpos, tvel, _) in &targets {
+                let dd = (tpos - tr.pos).length();
+                if dd < 15.0
+                    && dd > 0.5
+                    && tgt.map_or(true, |(_, _, bd)| dd < bd)
+                    && maze.los(tr.pos, tpos)
+                {
+                    tgt = Some((tpos, tvel, dd));
+                }
+            }
+            if let Some((tpos, tvel, dist)) = tgt {
+                let want = (tpos - tr.pos) / dist;
                 tr.aim = (tr.aim + (want - tr.aim) * (3.0 * dt).min(1.0)).normalize_or_zero();
                 tr.fire_cd -= dt;
                 if tr.fire_cd <= 0.0 && tr.aim.dot(want) > 0.92 {
                     tr.fire_cd = fire_interval;
-                    // Slight lead on the player.
-                    let lead = (ppos + self.vel * (dist / 7.5) * 0.35) - tr.pos;
+                    // Slight lead on the target.
+                    let lead = (tpos + tvel * (dist / 7.5) * 0.35) - tr.pos;
                     shots.push((tr.pos, lead.normalize_or_zero()));
                 }
             } else {
@@ -1791,7 +2142,7 @@ impl Game {
         }
 
         // ----- projectiles
-        let mut proj_hit: Option<Vec2> = None;
+        let mut proj_hits: Vec<(usize, Vec2)> = Vec::new();
         let mut proj_particles: Vec<Vec3> = Vec::new();
         self.projectiles.retain_mut(|p| {
             p.pos += p.vel * dt;
@@ -1801,23 +2152,37 @@ impl Game {
                 proj_particles.push(vec3(p.pos.x, 1.0, p.pos.y));
                 return false;
             }
-            if active && (p.pos - ppos).length() < 0.16 + PLAYER_R {
-                if self.invuln <= 0.0 {
-                    proj_hit = Some(p.vel.normalize_or_zero() * -1.0);
+            for &(ri, tpos, _, vuln) in &targets {
+                if (p.pos - tpos).length() < 0.16 + PLAYER_R {
+                    if vuln {
+                        proj_hits.push((ri, p.vel.normalize_or_zero() * -1.0));
+                    }
+                    proj_particles.push(vec3(p.pos.x, 1.0, p.pos.y));
+                    return false;
                 }
-                proj_particles.push(vec3(p.pos.x, 1.0, p.pos.y));
-                return false;
             }
             true
         });
         for pp in proj_particles {
             self.burst(pp, COL_OVERDRIVE, 7, 3.0);
         }
-        if let Some(dir) = hit_player {
-            self.hurt(damage, dir, snd);
+        for (ri, dir) in contact_hits {
+            if ri == usize::MAX {
+                if self.invuln <= 0.0 {
+                    self.hurt(damage, dir, snd);
+                }
+            } else {
+                self.remote_hurt(ri, damage, dir, snd);
+            }
         }
-        if let Some(dir) = proj_hit {
-            self.hurt(12.0, dir, snd);
+        for (ri, dir) in proj_hits {
+            if ri == usize::MAX {
+                if self.invuln <= 0.0 {
+                    self.hurt(12.0, dir, snd);
+                }
+            } else {
+                self.remote_hurt(ri, 12.0, dir, snd);
+            }
         }
 
         // ----- drone respawns
@@ -1832,17 +2197,90 @@ impl Game {
             }
         });
         for _ in 0..respawn_now {
+            let far = |c: Vec2, s: &Game| {
+                (c - s.ppos).length() > 12.0
+                    && s.remotes.iter().all(|r| !r.alive || (c - r.pos).length() > 12.0)
+            };
             let mut cells: Vec<(i32, i32)> = self
                 .maze
                 .open_cells()
                 .into_iter()
-                .filter(|&(x, y)| (self.maze.cell_center(x, y) - self.ppos).length() > 12.0)
+                .filter(|&(x, y)| far(self.maze.cell_center(x, y), self))
                 .collect();
             if cells.is_empty() {
                 cells = self.maze.open_cells();
             }
             let (x, y) = cells[gen_range(0, cells.len())];
-            self.drones.push(Drone::new(self.maze.cell_center(x, y)));
+            let id = self.next_drone_id;
+            self.next_drone_id = self.next_drone_id.wrapping_add(1).max(1);
+            self.drones.push(Drone::new(self.maze.cell_center(x, y), id));
+        }
+
+        // ----- co-op player respawns (host authority)
+        let mut respawned: Vec<usize> = Vec::new();
+        for (i, r) in self.remotes.iter_mut().enumerate() {
+            r.invuln -= dt;
+            r.overdrive_t = (r.overdrive_t - dt).max(0.0);
+            r.overdrive = r.overdrive_t > 0.0;
+            r.combo_t = (r.combo_t - dt).max(0.0);
+            if r.combo_t <= 0.0 {
+                r.combo = 1.0;
+            }
+            if !r.alive {
+                r.respawn_t -= dt;
+                if r.respawn_t <= 0.0 {
+                    respawned.push(i);
+                }
+            }
+        }
+        for i in respawned {
+            let sp = self.spawn_pos(i + 1);
+            let r = &mut self.remotes[i];
+            r.alive = true;
+            r.hp = 70.0;
+            r.pos = sp;
+            r.render_pos = sp;
+            r.invuln = 2.5;
+            r.respawn_t = 0.0;
+            self.burst(vec3(sp.x, 0.8, sp.y), COL_CRYSTAL, 16, 4.0);
+        }
+        if self.mp && self.my_respawn_t > 0.0 {
+            self.my_respawn_t -= dt;
+            if self.my_respawn_t <= 0.0 {
+                self.my_respawn_t = 0.0;
+                let sp = self.spawn_pos(0);
+                self.ppos = sp;
+                self.vel = Vec2::ZERO;
+                self.hp = 70.0;
+                self.invuln = 2.5;
+                self.popup("RESPAWNED".to_string());
+            }
+        }
+        } // end of host/single-player authority block
+
+        // Client-side: the respawn countdown is display-only (snapshots rule).
+        if self.net_client && self.my_respawn_t > 0.0 {
+            self.my_respawn_t = (self.my_respawn_t - dt).max(0.02);
+        }
+
+        // Remote-player cosmetics (all roles): run animation + dash trails.
+        let mut trails: Vec<Vec2> = Vec::new();
+        for r in self.remotes.iter_mut() {
+            r.anim_t += dt * (r.vel.length() / WALK_SPEED).min(1.6);
+            if r.alive && r.dashing && gen_range(0.0, 1.0) < (dt * 40.0).min(1.0) {
+                trails.push(r.render_pos);
+            }
+        }
+        for p in trails {
+            self.particles.push(Particle {
+                pos: vec3(p.x, 0.3 + gen_range(0.0, 0.5), p.y),
+                vel: vec3(0.0, gen_range(0.2, 0.8), 0.0),
+                life: 0.35,
+                max: 0.35,
+                size: 0.10,
+                color: COL_CRYSTAL,
+                grav: 0.0,
+            });
         }
 
         // ----- particles / popups / tracers / explosions
@@ -1873,6 +2311,413 @@ impl Game {
         let _ = t;
     }
 
+    // ----------------------------------------------------------- networking
+
+    /// Host-side: pack the authoritative world state.
+    fn build_snapshot(&self, seq: u32, phase: u8) -> Snapshot {
+        let mut players = Vec::with_capacity(1 + self.remotes.len());
+        players.push(PlayerBlob {
+            id: 0,
+            pos: self.ppos,
+            vel: self.vel,
+            yaw: self.yaw,
+            pitch: self.pitch,
+            hp: self.hp.max(0.0),
+            flags: (if self.my_respawn_t <= 0.0 { PF_ALIVE } else { 0 })
+                | (if self.dash_t > 0.0 { PF_DASH } else { 0 })
+                | (if self.overdrive_t > 0.0 { PF_OVERDRIVE } else { 0 }),
+            respawn_t: (self.my_respawn_t.max(0.0) * 10.0).min(255.0) as u8,
+            combo: self.combo as u8,
+            combo_t: (self.combo_t.max(0.0) * 10.0).min(255.0) as u8,
+            hurt_ctr: self.my_hurt_ctr,
+            hurt_dir: self.my_hurt_dir,
+            shot_ctr: self.my_shot_ctr,
+            od_t: (self.overdrive_t.max(0.0) * 10.0).min(255.0) as u8,
+        });
+        for r in &self.remotes {
+            players.push(PlayerBlob {
+                id: r.id,
+                pos: r.pos,
+                vel: r.vel,
+                yaw: r.yaw,
+                pitch: r.pitch,
+                hp: r.hp.max(0.0),
+                flags: (if r.alive { PF_ALIVE } else { 0 })
+                    | (if r.dashing { PF_DASH } else { 0 })
+                    | (if r.overdrive { PF_OVERDRIVE } else { 0 }),
+                respawn_t: (r.respawn_t.max(0.0) * 10.0).min(255.0) as u8,
+                combo: r.combo as u8,
+                combo_t: (r.combo_t.max(0.0) * 10.0).min(255.0) as u8,
+                hurt_ctr: r.hurt_ctr,
+                hurt_dir: r.hurt_dir,
+                shot_ctr: r.shot_ctr,
+                od_t: (r.overdrive_t.max(0.0) * 10.0).min(255.0) as u8,
+            });
+        }
+        let mut crystal_mask = 0u32;
+        for (i, c) in self.crystals.iter().take(32).enumerate() {
+            if c.taken {
+                crystal_mask |= 1 << i;
+            }
+        }
+        Snapshot {
+            seq,
+            shot_ack: 0, // patched per client just before sending
+            echo_seq: 0,
+            level: self.level,
+            seed: self.level_seed,
+            score: self.score,
+            phase,
+            kill_ctr: self.kill_ctr,
+            kill_pos: self.last_kill.0,
+            kill_big: self.last_kill.1 as u8,
+            crystal_mask,
+            players,
+            drones: self
+                .drones
+                .iter()
+                .map(|d| DroneBlob {
+                    id: d.id,
+                    pos: d.pos,
+                    dir: quant_angle(d.dir.y.atan2(d.dir.x)),
+                    state: match d.state {
+                        DroneState::Patrol => 0,
+                        DroneState::Chase => 1,
+                        DroneState::Investigate => 2,
+                    },
+                    hp: d.hp.max(0) as u8,
+                })
+                .collect(),
+            turrets: self
+                .turrets
+                .iter()
+                .map(|t| TurretBlob {
+                    alive: t.alive,
+                    aim: quant_angle(t.aim.y.atan2(t.aim.x)),
+                    charge: ((1.0 - t.fire_cd / 2.0).clamp(0.0, 1.0) * 255.0) as u8,
+                    hp: t.hp.max(0) as u8,
+                })
+                .collect(),
+            projectiles: self
+                .projectiles
+                .iter()
+                .map(|p| ProjBlob { pos: p.pos, vel: p.vel })
+                .collect(),
+            pickups: self
+                .pickups
+                .iter()
+                .map(|p| PickupBlob {
+                    kind: (p.kind == PickupKind::Overdrive) as u8,
+                    pos: p.pos,
+                    taken: p.taken,
+                })
+                .collect(),
+        }
+    }
+
+    /// Client-side: fold an authoritative snapshot in. One-shot effects
+    /// (kills, pickups, damage) derive from state diffs, so lost packets
+    /// only ever cost cosmetics.
+    fn apply_snapshot(&mut self, snap: &Snapshot, snd: &Option<Sounds>) {
+        self.score = snap.score;
+        self.net_phase = snap.phase;
+
+        if snap.kill_ctr != self.kill_ctr {
+            self.kill_ctr = snap.kill_ctr;
+            let big = snap.kill_big != 0;
+            let kp = vec3(snap.kill_pos.x, if big { 1.0 } else { 0.9 }, snap.kill_pos.y);
+            let col = if big {
+                Color::new(1.0, 0.3, 0.8, 1.0)
+            } else {
+                Color::new(1.0, 0.4, 0.15, 1.0)
+            };
+            self.burst(kp, col, if big { 34 } else { 26 }, if big { 7.0 } else { 6.0 });
+            self.explosions.push(Explosion { pos: kp, t: 0.0, big });
+            let vol = (1.0 - (snap.kill_pos - self.ppos).length() / 24.0).clamp(0.1, 0.6);
+            play(snd, |s| &s.kill, vol);
+        }
+
+        // Crystals by bitmask diff.
+        let mut crystal_fx: Vec<Vec2> = Vec::new();
+        for (i, c) in self.crystals.iter_mut().enumerate().take(32) {
+            let taken = snap.crystal_mask & (1 << i) != 0;
+            if taken && !c.taken {
+                c.taken = true;
+                crystal_fx.push(c.pos);
+            }
+        }
+        for cp in crystal_fx {
+            self.burst(vec3(cp.x, 1.0, cp.y), COL_CRYSTAL, 22, 5.0);
+            if (cp - self.ppos).length() < 2.5 {
+                self.pick_flash = 1.0;
+                self.popup("+CRYSTAL".to_string());
+                play(snd, |s| &s.pickup, 0.65);
+            } else {
+                let vol = (1.0 - (cp - self.ppos).length() / 22.0).clamp(0.05, 0.45);
+                play(snd, |s| &s.pickup, vol);
+            }
+        }
+
+        // Pickups: full list, effects on taken transitions.
+        let mut pickup_fx: Vec<(PickupKind, Vec2)> = Vec::new();
+        for (i, pb) in snap.pickups.iter().enumerate() {
+            let kind = if pb.kind == 1 { PickupKind::Overdrive } else { PickupKind::Health };
+            if let Some(p) = self.pickups.get_mut(i) {
+                if pb.taken && !p.taken {
+                    pickup_fx.push((kind, pb.pos));
+                }
+                p.taken = pb.taken;
+                if !pb.taken {
+                    p.pos = pb.pos; // follow the host-side magnet
+                }
+            } else {
+                self.pickups.push(Pickup {
+                    pos: pb.pos,
+                    kind,
+                    phase: i as f32 * 1.3,
+                    taken: pb.taken,
+                });
+            }
+        }
+        for (kind, pp) in pickup_fx {
+            let near = (pp - self.ppos).length() < 2.5;
+            let vol = if near {
+                0.7
+            } else {
+                (1.0 - (pp - self.ppos).length() / 22.0).clamp(0.05, 0.4)
+            };
+            match kind {
+                PickupKind::Health => {
+                    if near {
+                        self.popup("+30 HP".to_string());
+                    }
+                    self.burst(vec3(pp.x, 0.8, pp.y), GREEN, 18, 4.5);
+                    play(snd, |s| &s.health, vol);
+                }
+                PickupKind::Overdrive => {
+                    if near {
+                        self.popup("OVERDRIVE".to_string());
+                    }
+                    self.burst(vec3(pp.x, 0.8, pp.y), COL_OVERDRIVE, 24, 5.5);
+                    play(snd, |s| &s.pickup, vol);
+                }
+            }
+        }
+
+        // Turret damage flashes (death FX come via kill_ctr).
+        for (i, tb) in snap.turrets.iter().enumerate() {
+            if let Some(t) = self.turrets.get_mut(i) {
+                if (tb.hp as i32) < t.hp {
+                    t.hit_flash = 1.0;
+                }
+                t.hp = tb.hp as i32;
+                t.alive = tb.alive;
+            }
+        }
+        for db in &snap.drones {
+            if let Some(d) = self.drones.iter_mut().find(|d| d.id == db.id) {
+                if (db.hp as i32) < d.hp {
+                    d.hit_flash = 1.0;
+                }
+                d.hp = db.hp as i32;
+            }
+        }
+
+        // My own authoritative state.
+        if let Some(me) = snap.players.iter().find(|p| p.id == self.my_id) {
+            if me.hurt_ctr != self.my_hurt_ctr {
+                self.my_hurt_ctr = me.hurt_ctr;
+                let ang = dequant_angle(me.hurt_dir);
+                let dirv = vec2(ang.cos(), ang.sin());
+                self.dmg_flash = 1.0;
+                self.shake = (self.shake + 0.6).min(1.2);
+                self.vel += -dirv * 9.0;
+                self.last_hit_dir = Some((ang, 1.2));
+                play(snd, |s| &s.hurt, 0.7);
+            }
+            let was_dead = self.my_respawn_t > 0.0;
+            let dead = me.flags & PF_ALIVE == 0;
+            if dead {
+                self.my_respawn_t = (me.respawn_t as f32 / 10.0).max(0.05);
+                if !was_dead {
+                    self.dmg_flash = 1.4;
+                    play(snd, |s| &s.death, 0.8);
+                }
+            } else if was_dead {
+                self.my_respawn_t = 0.0;
+                self.ppos = me.pos;
+                self.vel = Vec2::ZERO;
+                self.invuln = 2.5;
+                self.popup("RESPAWNED".to_string());
+            }
+            self.hp = me.hp;
+            self.combo = (me.combo as f32).max(1.0);
+            self.combo_t = me.combo_t as f32 / 10.0;
+            self.overdrive_t = me.od_t as f32 / 10.0;
+        }
+
+        // Everyone else.
+        for pb in &snap.players {
+            if pb.id == self.my_id {
+                continue;
+            }
+            let ri = match self.remotes.iter().position(|r| r.id == pb.id) {
+                Some(i) => i,
+                None => {
+                    self.remotes.push(RemotePlayer::new(pb.id, pb.pos));
+                    self.world_popups.push(WorldPopup {
+                        pos: vec3(pb.pos.x, 1.5, pb.pos.y),
+                        text: format!("P{} JOINED", pb.id as u32 + 1),
+                        t: 1.6,
+                    });
+                    self.remotes.len() - 1
+                }
+            };
+            let (mut fx_shot, mut fx_hurt) = (false, false);
+            let (fx_died, fx_spawn);
+            {
+                let r = &mut self.remotes[ri];
+                if pb.shot_ctr != r.shot_ctr {
+                    r.shot_ctr = pb.shot_ctr;
+                    fx_shot = true;
+                }
+                if pb.hurt_ctr != r.hurt_ctr {
+                    r.hurt_ctr = pb.hurt_ctr;
+                    fx_hurt = true;
+                }
+                let alive = pb.flags & PF_ALIVE != 0;
+                fx_died = r.alive && !alive;
+                fx_spawn = !r.alive && alive;
+                r.alive = alive;
+                r.pos = pb.pos;
+                r.vel = pb.vel;
+                r.yaw = pb.yaw;
+                r.pitch = pb.pitch;
+                r.hp = pb.hp;
+                r.respawn_t = pb.respawn_t as f32 / 10.0;
+                r.dashing = pb.flags & PF_DASH != 0;
+                r.overdrive = pb.flags & PF_OVERDRIVE != 0;
+            }
+            let rp = self.remotes[ri].pos;
+            let vol = (1.0 - (rp - self.ppos).length() / 22.0).clamp(0.05, 0.45);
+            if fx_shot {
+                let eye = vec3(rp.x, EYE_H, rp.y);
+                let yaw = self.remotes[ri].yaw;
+                let pitch = self.remotes[ri].pitch;
+                let dir = vec3(yaw.cos() * pitch.cos(), pitch.sin(), yaw.sin() * pitch.cos());
+                let (wall_t, best) = self.scan_targets(eye, dir);
+                let hit_t = best.map_or(wall_t, |(_, t, _)| t);
+                self.tracers.push(Tracer {
+                    from: eye + dir * 0.4,
+                    to: eye + dir * hit_t,
+                    ttl: 0.06,
+                });
+                play(snd, |s| &s.shoot, vol);
+            }
+            if fx_hurt {
+                self.burst(vec3(rp.x, 0.8, rp.y), Color::new(1.0, 0.2, 0.2, 1.0), 10, 4.0);
+                play(snd, |s| &s.hurt, vol * 0.8);
+            }
+            if fx_died {
+                self.burst(vec3(rp.x, 0.9, rp.y), Color::new(1.0, 0.25, 0.2, 1.0), 24, 5.5);
+                self.world_popups.push(WorldPopup {
+                    pos: vec3(rp.x, 1.4, rp.y),
+                    text: format!("P{} DOWN", self.remotes[ri].id as u32 + 1),
+                    t: 1.6,
+                });
+                play(snd, |s| &s.death, vol);
+            }
+            if fx_spawn {
+                self.burst(vec3(rp.x, 0.8, rp.y), COL_CRYSTAL, 16, 4.0);
+            }
+        }
+        // Drop players that left the session.
+        self.remotes.retain(|r| snap.players.iter().any(|p| p.id == r.id));
+    }
+
+    /// Client-side: rebuild interpolated entity state from buffered snapshots.
+    fn net_interp(&mut self, snaps: &VecDeque<(f64, Snapshot)>, now: f64, dt: f32) {
+        let (ta, a, tb, b) = match snaps.len() {
+            0 => return,
+            1 => {
+                let (t0, s0) = &snaps[0];
+                (*t0, s0, *t0, s0)
+            }
+            n => {
+                let rt = now - 0.13;
+                let mut ia = n - 2;
+                while ia > 0 && snaps[ia].0 > rt {
+                    ia -= 1;
+                }
+                let (t0, s0) = &snaps[ia];
+                let (t1, s1) = &snaps[ia + 1];
+                (*t0, s0, *t1, s1)
+            }
+        };
+        let k = if tb > ta {
+            (((now - 0.13) - ta) / (tb - ta)).clamp(0.0, 1.0) as f32
+        } else {
+            1.0
+        };
+
+        // Drones: lerp matching ids, keep cosmetic fields alive.
+        let mut new_drones: Vec<Drone> = Vec::with_capacity(b.drones.len());
+        for db in &b.drones {
+            let from = a.drones.iter().find(|x| x.id == db.id).map_or(db.pos, |x| x.pos);
+            let mut d = Drone::new(from.lerp(db.pos, k), db.id);
+            if let Some(old) = self.drones.iter().find(|x| x.id == db.id) {
+                d.phase = old.phase;
+                d.hit_flash = (old.hit_flash - dt * 6.0).max(0.0);
+            } else {
+                d.phase = db.id as f32 * 0.77;
+            }
+            let ang = dequant_angle(db.dir);
+            d.dir = vec2(ang.cos(), ang.sin());
+            d.state = match db.state {
+                1 => DroneState::Chase,
+                2 => DroneState::Investigate,
+                _ => DroneState::Patrol,
+            };
+            d.hp = db.hp as i32;
+            new_drones.push(d);
+        }
+        self.drones = new_drones;
+
+        // Projectiles fly straight: dead-reckon from the newest snapshot.
+        let age = (now - tb).max(0.0) as f32;
+        self.projectiles = b
+            .projectiles
+            .iter()
+            .map(|p| Projectile { pos: p.pos + p.vel * age, vel: p.vel, ttl: 1.0 })
+            .collect();
+
+        // Turret aim interpolation; alive/hp arrive via apply_snapshot.
+        for (i, tbl) in b.turrets.iter().enumerate() {
+            if let Some(t) = self.turrets.get_mut(i) {
+                let ang_b = dequant_angle(tbl.aim);
+                let ang_a = a.turrets.get(i).map_or(ang_b, |x| dequant_angle(x.aim));
+                let ang = ang_a + wrap_angle(ang_b - ang_a) * k;
+                t.aim = vec2(ang.cos(), ang.sin());
+                t.fire_cd = (1.0 - tbl.charge as f32 / 255.0) * 2.0;
+                t.hit_flash = (t.hit_flash - dt * 6.0).max(0.0);
+            }
+        }
+
+        // Other players.
+        for pb in &b.players {
+            if pb.id == self.my_id {
+                continue;
+            }
+            let pa = a.players.iter().find(|x| x.id == pb.id);
+            let from = pa.map_or(pb.pos, |x| x.pos);
+            let yaw_a = pa.map_or(pb.yaw, |x| x.yaw);
+            if let Some(r) = self.remotes.iter_mut().find(|r| r.id == pb.id) {
+                r.render_pos = from.lerp(pb.pos, k);
+                r.render_yaw = yaw_a + wrap_angle(pb.yaw - yaw_a) * k;
+            }
+        }
+    }
+
     // -------------------------------------------------------------- lights
 
     fn collect_lights(&self, eye: Vec3) -> ([Vec4; 12], [Vec4; 12]) {
@@ -1886,6 +2731,20 @@ impl Game {
             radius: 10.0,
             intensity: 0.85,
         });
+        // Co-op partners carry a tinted lamp.
+        for r in self.remotes.iter().filter(|r| r.alive) {
+            let pc = player_color(r.id);
+            lights.push(LightSrc {
+                pos: vec3(r.render_pos.x, 1.3, r.render_pos.y),
+                color: vec3(
+                    0.65 + pc.r * 0.35,
+                    0.65 + pc.g * 0.35,
+                    0.65 + pc.b * 0.35,
+                ),
+                radius: 8.0,
+                intensity: 0.65,
+            });
+        }
         if self.muzzle_flash > 0.0 {
             lights.push(LightSrc {
                 pos: self.muzzle_world(),
@@ -2047,6 +2906,40 @@ impl Game {
                 );
             }
         }
+        // Co-op partner avatars (lit).
+        for r in self.remotes.iter().filter(|r| r.alive) {
+            let dist = (r.render_pos - eye2).length();
+            if dist > fog_max + 4.0 {
+                continue;
+            }
+            let base = vec3(r.render_pos.x, 0.0, r.render_pos.y);
+            let f3 = vec3(r.render_yaw.cos(), 0.0, r.render_yaw.sin());
+            let s3 = vec3(-r.render_yaw.sin(), 0.0, r.render_yaw.cos());
+            let bob = (r.anim_t * 9.5).sin() * 0.03 * (r.vel.length() / SPRINT_SPEED).min(1.0);
+            let suit = Color::new(0.16, 0.17, 0.24, 1.0);
+            lit.box_center(
+                base + vec3(0.0, 0.78 + bob, 0.0),
+                s3 * 0.40,
+                vec3(0.0, 0.50, 0.0),
+                f3 * 0.24,
+                suit,
+            );
+            lit.box_center(
+                base + vec3(0.0, 0.30, 0.0),
+                s3 * 0.28,
+                vec3(0.0, 0.46, 0.0),
+                f3 * 0.20,
+                cmul(suit, 0.75),
+            );
+            lit.sphere(base + vec3(0.0, 1.20 + bob, 0.0), 0.16, 6, 8, suit);
+            lit.box_center(
+                base + vec3(0.0, 0.92 + bob, 0.0) + f3 * 0.30 + s3 * 0.16,
+                s3 * 0.055,
+                vec3(0.0, 0.055, 0.0),
+                f3 * 0.34,
+                Color::new(0.10, 0.10, 0.15, 1.0),
+            );
+        }
         // Viewmodel (lit, first-person only).
         let mut vm_basis = None;
         if fp_view {
@@ -2087,6 +2980,34 @@ impl Game {
             em.box_center(anchor + f * 0.245 + u * 0.008, r * 0.030, u * 0.030, f * 0.012, strip);
             draw_mesh(&em.build());
             muzzle_vm = Some(anchor + f * 0.26 + u * 0.008);
+        }
+
+        // Partner emissive accents: visor + chest strip in their color.
+        for r in self.remotes.iter().filter(|r| r.alive) {
+            if (r.render_pos - eye2).length() > fog_max + 4.0 {
+                continue;
+            }
+            let base = vec3(r.render_pos.x, 0.0, r.render_pos.y);
+            let f3 = vec3(r.render_yaw.cos(), 0.0, r.render_yaw.sin());
+            let s3 = vec3(-r.render_yaw.sin(), 0.0, r.render_yaw.cos());
+            let bob = (r.anim_t * 9.5).sin() * 0.03 * (r.vel.length() / SPRINT_SPEED).min(1.0);
+            let pc = if r.overdrive { COL_OVERDRIVE } else { player_color(r.id) };
+            let mut em = MeshBuilder::new();
+            em.box_center(
+                base + vec3(0.0, 1.21 + bob, 0.0) + f3 * 0.13,
+                s3 * 0.105,
+                vec3(0.0, 0.045, 0.0),
+                f3 * 0.045,
+                pc,
+            );
+            em.box_center(
+                base + vec3(0.0, 0.90 + bob, 0.0) + f3 * 0.125,
+                s3 * 0.05,
+                vec3(0.0, 0.14, 0.0),
+                f3 * 0.02,
+                pc,
+            );
+            draw_mesh(&em.build());
         }
 
         // ---- emissive pass
@@ -2249,6 +3170,16 @@ impl Game {
                 let size = (if e.big { 4.5 } else { 3.0 }) * (0.3 + k * 0.7);
                 glow(e.pos, size, Color::new(1.0, 0.45, 0.15, (1.0 - k) * 0.8));
             }
+            for r in self.remotes.iter().filter(|r| r.alive) {
+                if (r.render_pos - eye2).length() > fog_max + 6.0 {
+                    continue;
+                }
+                glow(
+                    vec3(r.render_pos.x, 0.95, r.render_pos.y),
+                    1.5,
+                    with_alpha(player_color(r.id), 0.22),
+                );
+            }
             if self.muzzle_flash > 0.0 {
                 if let Some(m) = muzzle_vm {
                     glow(m, 0.45, Color::new(0.5, 1.0, 1.0, self.muzzle_flash * 0.9));
@@ -2353,6 +3284,24 @@ impl Game {
             }
         }
 
+        // Partner nametags + floating health.
+        for r in self.remotes.iter().filter(|r| r.alive) {
+            let d = (r.render_pos - self.ppos).length();
+            if d > 28.0 {
+                continue;
+            }
+            if let Some(s) = self.world_to_screen(vec3(r.render_pos.x, 1.62, r.render_pos.y)) {
+                let pc = player_color(r.id);
+                let a = (1.0 - d / 28.0).clamp(0.25, 0.9);
+                let label = format!("P{}", r.id as u32 + 1);
+                let dim = measure_text(&label, None, 20, 1.0);
+                draw_text(&label, s.x - dim.width / 2.0, s.y, 20.0, with_alpha(pc, a));
+                let frac = (r.hp / 100.0).clamp(0.0, 1.0);
+                draw_rectangle(s.x - 18.0, s.y + 4.0, 36.0, 4.0, with_alpha(BLACK, 0.5 * a));
+                draw_rectangle(s.x - 18.0, s.y + 4.0, 36.0 * frac, 4.0, with_alpha(pc, a));
+            }
+        }
+
         // Crosshair with recoil spread.
         let sp = 4.0 + self.recoil * 280.0;
         let ch = with_alpha(WHITE, 0.85);
@@ -2418,6 +3367,26 @@ impl Game {
             30.0,
             ccol,
         );
+
+        // Co-op partner status.
+        for (i, r) in self.remotes.iter().enumerate() {
+            let y = 134.0 + i as f32 * 26.0;
+            let pc = player_color(r.id);
+            draw_text(&format!("P{}", r.id as u32 + 1), 22.0, y, 24.0, pc);
+            if r.alive {
+                let frac = (r.hp / 100.0).clamp(0.0, 1.0);
+                draw_rectangle(62.0, y - 13.0, 90.0, 11.0, with_alpha(BLACK, 0.5));
+                draw_rectangle(62.0, y - 13.0, 90.0 * frac, 11.0, with_alpha(pc, 0.9));
+            } else {
+                draw_text(
+                    &format!("DOWN {:.0}", r.respawn_t.max(0.0).ceil()),
+                    62.0,
+                    y,
+                    22.0,
+                    with_alpha(RED, 0.8),
+                );
+            }
+        }
 
         // Combo.
         if self.combo > 1.0 && self.combo_t > 0.0 {
@@ -2510,6 +3479,10 @@ impl Game {
             let col = if chasing { RED } else { ORANGE };
             draw_circle(p.x, p.y, 2.8, col);
         }
+        for r in self.remotes.iter().filter(|r| r.alive) {
+            let p = to_mm(r.render_pos);
+            draw_circle(p.x, p.y, 3.0, player_color(r.id));
+        }
         let pp = to_mm(self.ppos);
         let fd = vec2(self.yaw.cos(), self.yaw.sin());
         draw_line(pp.x, pp.y, pp.x + fd.x * 9.0, pp.y + fd.y * 9.0, 2.0, with_alpha(WHITE, 0.8));
@@ -2591,6 +3564,34 @@ impl Game {
             );
         }
 
+        // Network status (bottom right, above FPS).
+        if !self.net_status.is_empty() {
+            let d = measure_text(&self.net_status, None, 20, 1.0);
+            draw_text(
+                &self.net_status,
+                sw - d.width - 14.0,
+                sh - 40.0,
+                20.0,
+                with_alpha(COL_UI, 0.55),
+            );
+        }
+
+        // Down / respawning overlay (co-op).
+        if self.mp && self.my_respawn_t > 0.0 {
+            draw_rectangle(0.0, 0.0, sw, sh, Color::new(0.25, 0.0, 0.02, 0.45));
+            center_text("YOU ARE DOWN", sh * 0.40, 56.0, Color::new(1.0, 0.25, 0.2, 1.0));
+            center_text(
+                &format!("respawn in {:.1}", self.my_respawn_t),
+                sh * 0.40 + 40.0,
+                28.0,
+                with_alpha(WHITE, 0.85),
+            );
+        }
+        // Level-clear banner mirrored from the host.
+        if self.net_client && self.net_phase == 1 {
+            center_text("LEVEL CLEARED", sh * 0.30, 56.0, GREEN);
+        }
+
         draw_text(
             &format!("{} FPS", get_fps()),
             sw - 86.0,
@@ -2608,6 +3609,231 @@ enum Mode {
     Playing,
     LevelDone(f32),
     Dead,
+}
+
+enum Role {
+    None,
+    Host(HostNet),
+    Client(ClientNet),
+}
+
+fn fresh_seed() -> u64 {
+    ((macroquad::rand::rand() as u64) << 32) ^ macroquad::rand::rand() as u64
+}
+
+/// Host: drain the socket — greet joiners, fold in client states, fire their
+/// queued shots, drop the silent.
+fn host_pump(hn: &mut HostNet, game: &mut Game, snd: &Option<Sounds>, now: f64) {
+    for (addr, p) in hn.recv_all() {
+        match p {
+            Packet::Hello { ver } => {
+                if ver != VER {
+                    continue;
+                }
+                let id = match hn.clients.iter().find(|c| c.addr == addr) {
+                    Some(c) => c.id,
+                    None => {
+                        if hn.clients.len() + 1 >= MAX_PLAYERS {
+                            continue;
+                        }
+                        let id = hn.next_id;
+                        hn.next_id = hn.next_id.wrapping_add(1).max(1);
+                        let spawn = game.spawn_pos(game.remotes.len() + 1);
+                        let mut rp = RemotePlayer::new(id, spawn);
+                        rp.invuln = 2.5;
+                        game.remotes.push(rp);
+                        game.popup(format!("P{} JOINED", id as u32 + 1));
+                        hn.clients.push(HostClient {
+                            addr,
+                            id,
+                            last_recv: now,
+                            last_state_seq: 0,
+                            shot_ack: 0,
+                            echo_seq: 0,
+                        });
+                        id
+                    }
+                };
+                let spawn = game
+                    .remotes
+                    .iter()
+                    .find(|r| r.id == id)
+                    .map_or(game.ppos, |r| r.pos);
+                hn.send_to(
+                    addr,
+                    &Packet::Welcome {
+                        ver: VER,
+                        id,
+                        level: game.level,
+                        seed: game.level_seed,
+                        score: game.score,
+                        spawn,
+                    },
+                );
+            }
+            Packet::State(cs) => {
+                let Some(ci) = hn
+                    .clients
+                    .iter()
+                    .position(|c| c.addr == addr && c.id == cs.id)
+                else {
+                    continue;
+                };
+                {
+                    let c = &mut hn.clients[ci];
+                    let d = cs.seq.wrapping_sub(c.last_state_seq);
+                    if c.last_state_seq != 0 && (d == 0 || d > 0x8000_0000) {
+                        continue; // stale or duplicate
+                    }
+                    c.last_state_seq = cs.seq;
+                    c.echo_seq = cs.seq;
+                    c.last_recv = now;
+                }
+                let resolved = game.maze.resolve(cs.pos, PLAYER_R);
+                if let Some(r) = game.remotes.iter_mut().find(|r| r.id == cs.id) {
+                    if r.alive {
+                        r.pos = resolved;
+                        r.render_pos = resolved;
+                        r.vel = cs.vel;
+                        r.yaw = cs.yaw;
+                        r.render_yaw = cs.yaw;
+                        r.pitch = cs.pitch.clamp(-1.45, 1.45);
+                        r.dashing = cs.flags & PF_DASH != 0;
+                    }
+                }
+                for sh in &cs.shots {
+                    let dlt = sh.id.wrapping_sub(hn.clients[ci].shot_ack);
+                    if dlt == 0 || dlt >= 0x8000 {
+                        continue; // already processed
+                    }
+                    hn.clients[ci].shot_ack = sh.id;
+                    if let Some(ri) = game.remotes.iter().position(|r| r.id == cs.id) {
+                        if game.remotes[ri].alive {
+                            game.remote_shot(ri, sh.origin, sh.dir, snd);
+                            if std::env::var("CR_SHOT").ok().as_deref() == Some("mphost") {
+                                println!("net: applied shot {} from P{}", sh.id, cs.id as u32 + 1);
+                            }
+                        }
+                    }
+                }
+            }
+            Packet::Bye { id } => {
+                if let Some(i) = hn
+                    .clients
+                    .iter()
+                    .position(|c| c.addr == addr && c.id == id)
+                {
+                    hn.clients.remove(i);
+                    game.remotes.retain(|r| r.id != id);
+                    game.popup(format!("P{} LEFT", id as u32 + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    // Timeouts.
+    let mut timed_out: Vec<u8> = Vec::new();
+    hn.clients.retain(|c| {
+        if now - c.last_recv > 5.0 {
+            timed_out.push(c.id);
+            false
+        } else {
+            true
+        }
+    });
+    for id in timed_out {
+        game.remotes.retain(|r| r.id != id);
+        game.popup(format!("P{} LOST", id as u32 + 1));
+    }
+}
+
+/// Client: drain the socket. Returns (welcomed this frame, kicked by host).
+fn client_pump(
+    cn: &mut ClientNet,
+    game: &mut Game,
+    snd: &Option<Sounds>,
+    now: f64,
+) -> (bool, bool) {
+    let mut welcomed = false;
+    let mut kicked = false;
+    if cn.my_id.is_none() && now - cn.hello_t > 0.5 {
+        cn.hello_t = now;
+        cn.send(&Packet::Hello { ver: VER });
+    }
+    for p in cn.recv_all() {
+        match p {
+            Packet::Welcome { ver, id, level, seed, score, spawn } => {
+                if ver != VER || cn.my_id.is_some() {
+                    continue;
+                }
+                cn.my_id = Some(id);
+                cn.last_recv = now;
+                let mut ng = Game::new(level, score, 100.0, RunStats::default(), seed);
+                ng.mp = true;
+                ng.net_client = true;
+                ng.my_id = id;
+                ng.ppos = spawn;
+                ng.vel = Vec2::ZERO;
+                *game = ng;
+                welcomed = true;
+            }
+            Packet::Snap(snap) => {
+                if cn.my_id.is_none() {
+                    continue;
+                }
+                let d = snap.seq.wrapping_sub(cn.last_snap_seq);
+                if cn.last_snap_seq != 0 && (d == 0 || d > 0x8000_0000) {
+                    continue;
+                }
+                cn.last_snap_seq = snap.seq;
+                cn.last_recv = now;
+                // RTT from the echoed state sequence.
+                while let Some(&(s, t0)) = cn.sent_times.front() {
+                    if snap.echo_seq.wrapping_sub(s) < 0x8000_0000 {
+                        if s == snap.echo_seq {
+                            cn.rtt = (now - t0) as f32;
+                        }
+                        cn.sent_times.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+                cn.ack_shots(snap.shot_ack);
+                if snap.level != game.level || snap.seed != game.level_seed {
+                    // New level: regenerate the identical world from the seed.
+                    let mut ng = Game::new(
+                        snap.level,
+                        snap.score,
+                        100.0,
+                        RunStats::default(),
+                        snap.seed,
+                    );
+                    ng.mp = true;
+                    ng.net_client = true;
+                    ng.my_id = game.my_id;
+                    ng.my_hurt_ctr = game.my_hurt_ctr;
+                    ng.my_shot_ctr = game.my_shot_ctr;
+                    ng.kill_ctr = snap.kill_ctr;
+                    ng.net_status = std::mem::take(&mut game.net_status);
+                    if let Some(me) = snap.players.iter().find(|p| p.id == game.my_id) {
+                        ng.ppos = me.pos;
+                    }
+                    *game = ng;
+                    cn.snaps.clear();
+                }
+                game.apply_snapshot(&snap, snd);
+                cn.snaps.push_back((now, *snap));
+                while cn.snaps.len() > 4 {
+                    cn.snaps.pop_front();
+                }
+            }
+            Packet::Bye { .. } => {
+                kicked = true;
+            }
+            _ => {}
+        }
+    }
+    (welcomed, kicked)
 }
 
 fn window_conf() -> Conf {
@@ -2645,8 +3871,48 @@ async fn main() {
         }
     }
 
-    let mut game = Game::new(1, 0, 100.0, RunStats::default());
-    let mut mode = if shot_mode && shot_var != "menu" { Mode::Playing } else { Mode::Menu };
+    // --- multiplayer launch options: --host [port] / --join <ip[:port]>
+    let args: Vec<String> = std::env::args().collect();
+    let mut auto_host: Option<u16> = None;
+    let mut auto_join: Option<String> = None;
+    let mut ai = 1;
+    while ai < args.len() {
+        match args[ai].as_str() {
+            "--host" => {
+                let port = args.get(ai + 1).and_then(|s| s.parse::<u16>().ok());
+                if port.is_some() {
+                    ai += 1;
+                }
+                auto_host = Some(port.unwrap_or(DEFAULT_PORT));
+            }
+            "--join" => {
+                if let Some(a) = args.get(ai + 1) {
+                    auto_join = Some(a.clone());
+                    ai += 1;
+                }
+            }
+            _ => {}
+        }
+        ai += 1;
+    }
+    // Loopback self-test scenarios.
+    if shot_var == "mphost" {
+        auto_host = Some(24788);
+        auto_join = None;
+    }
+    if shot_var == "mpjoin" {
+        auto_join = Some("127.0.0.1:24788".to_string());
+        auto_host = None;
+    }
+    let host_port = auto_host.unwrap_or(DEFAULT_PORT);
+
+    let seed0: u64 = if shot_mode { 12345 } else { fresh_seed() };
+    let mut game = Game::new(1, 0, 100.0, RunStats::default(), seed0);
+    let mut mode = if shot_mode && shot_var != "menu" && shot_var != "mpjoin" {
+        Mode::Playing
+    } else {
+        Mode::Menu
+    };
     let mut paused = false;
     let mut grabbed = false;
     let mut last_mouse: Vec2 = mouse_position().into();
@@ -2654,6 +3920,34 @@ async fn main() {
     let mut sens: f32 = 1.0;
     let mut hitstop = 0.0_f32;
     let mut frame: u32 = 0;
+
+    let mut role = Role::None;
+    let mut join_input: Option<String> = None;
+    let mut menu_msg = String::new();
+    if let Some(port) = auto_host {
+        match HostNet::bind(port) {
+            Ok(hn) => {
+                role = Role::Host(hn);
+                game.mp = true;
+                mode = Mode::Playing;
+            }
+            Err(e) => {
+                eprintln!("crystal-rush: cannot host on udp port {}: {}", port, e);
+                std::process::exit(2);
+            }
+        }
+    } else if let Some(addr) = &auto_join {
+        match ClientNet::connect(addr, get_time()) {
+            Ok(cn) => {
+                role = Role::Client(cn);
+                mode = Mode::Menu;
+            }
+            Err(e) => {
+                eprintln!("crystal-rush: cannot join {}: {}", addr, e);
+                std::process::exit(2);
+            }
+        }
+    }
 
     // Combat screenshot scenario: place a chasing drone ahead of the player.
     if shot_var == "combat" && !game.drones.is_empty() {
@@ -2675,6 +3969,10 @@ async fn main() {
         }
     }
 
+    if !shot_mode && matches!(role, Role::Host(_)) {
+        set_grab(true, &mut grabbed);
+    }
+
     loop {
         let real_dt = get_frame_time().min(0.05);
         let dt = if hitstop > 0.0 { real_dt * 0.12 } else { real_dt };
@@ -2683,6 +3981,60 @@ async fn main() {
         let mp: Vec2 = mouse_position().into();
         let mouse_delta = mp - last_mouse;
         last_mouse = mp;
+
+        // ---- network: receive
+        let tnow = get_time();
+        let mut just_welcomed = false;
+        let mut net_lost: Option<&'static str> = None;
+        match &mut role {
+            Role::Host(hn) => {
+                host_pump(hn, &mut game, &sounds, tnow);
+                game.net_status = if hn.clients.is_empty() {
+                    format!("HOSTING :{} | waiting for players", hn.port)
+                } else {
+                    format!("HOSTING :{} | {} connected", hn.port, hn.clients.len())
+                };
+            }
+            Role::Client(cn) => {
+                let (welcomed, kicked) = client_pump(cn, &mut game, &sounds, tnow);
+                just_welcomed = welcomed;
+                if kicked {
+                    net_lost = Some("host closed the session");
+                } else if cn.my_id.is_some() && tnow - cn.last_recv > 5.0 {
+                    net_lost = Some("connection lost");
+                } else if cn.my_id.is_none() && tnow - cn.started > 8.0 {
+                    net_lost = Some("no response from host");
+                }
+                if cn.my_id.is_some() {
+                    game.net_status =
+                        format!("ONLINE | ping {} ms", (cn.rtt * 1000.0).round() as i32);
+                }
+            }
+            Role::None => {}
+        }
+        if just_welcomed {
+            mode = Mode::Playing;
+            paused = false;
+            if !shot_mode {
+                set_grab(true, &mut grabbed);
+            }
+        }
+        if let Some(msg) = net_lost {
+            role = Role::None;
+            menu_msg = msg.to_string();
+            game.mp = false;
+            game.net_client = false;
+            game.remotes.clear();
+            game.net_status.clear();
+            mode = Mode::Menu;
+            set_grab(false, &mut grabbed);
+        }
+        // Client: rebuild interpolated entity state for this frame.
+        if let Role::Client(cn) = &role {
+            if cn.my_id.is_some() {
+                game.net_interp(&cn.snaps, tnow, real_dt);
+            }
+        }
 
         clear_background(COL_BG);
 
@@ -2722,30 +4074,119 @@ async fn main() {
                     24.0,
                     with_alpha(WHITE, 0.6),
                 );
+                center_text(
+                    "ONLINE CO-OP:   H  host    J  join by IP",
+                    ch + 52.0,
+                    24.0,
+                    with_alpha(Color::new(0.55, 1.0, 0.65, 1.0), 0.8),
+                );
                 if let Some((s, l)) = last_score {
                     center_text(
                         &format!("last run:  {} pts,  level {}", s, l),
-                        ch + 64.0,
+                        ch + 88.0,
                         24.0,
                         with_alpha(COL_CRYSTAL, 0.8),
                     );
                 }
                 center_text(
                     "press  ENTER  or  CLICK  to start",
-                    ch + 120.0,
+                    ch + 132.0,
                     32.0,
                     with_alpha(WHITE, pulse),
                 );
-                center_text("Q to quit", ch + 156.0, 20.0, with_alpha(WHITE, 0.4));
-
-                if is_key_pressed(KeyCode::Enter) || is_mouse_button_pressed(MouseButton::Left) {
-                    game = Game::new(1, 0, 100.0, RunStats::default());
-                    mode = Mode::Playing;
-                    paused = false;
-                    set_grab(true, &mut grabbed);
+                center_text("Q to quit", ch + 166.0, 20.0, with_alpha(WHITE, 0.4));
+                if !menu_msg.is_empty() {
+                    center_text(&menu_msg, ch + 196.0, 22.0, Color::new(1.0, 0.45, 0.35, 1.0));
                 }
-                if is_key_pressed(KeyCode::Q) || is_key_pressed(KeyCode::Escape) {
-                    break;
+
+                let connecting = matches!(role, Role::Client(ref c) if c.my_id.is_none());
+                if let Some(buf) = &mut join_input {
+                    draw_rectangle(
+                        0.0,
+                        0.0,
+                        screen_width(),
+                        screen_height(),
+                        with_alpha(BLACK, 0.5),
+                    );
+                    center_text("JOIN GAME", ch - 70.0, 44.0, COL_UI);
+                    center_text(
+                        "type the host address (ip or ip:port)",
+                        ch - 34.0,
+                        22.0,
+                        with_alpha(WHITE, 0.7),
+                    );
+                    center_text(&format!("{}_", buf), ch + 20.0, 36.0, WHITE);
+                    center_text(
+                        "ENTER  connect      ESC  cancel",
+                        ch + 64.0,
+                        22.0,
+                        with_alpha(WHITE, 0.6),
+                    );
+                    while let Some(c) = get_char_pressed() {
+                        if (c.is_ascii_alphanumeric() || c == '.' || c == ':' || c == '-')
+                            && buf.len() < 40
+                        {
+                            buf.push(c);
+                        }
+                    }
+                    if is_key_pressed(KeyCode::Backspace) {
+                        buf.pop();
+                    }
+                    if is_key_pressed(KeyCode::Enter) && !buf.is_empty() {
+                        match ClientNet::connect(buf, get_time()) {
+                            Ok(cn) => {
+                                role = Role::Client(cn);
+                                menu_msg.clear();
+                            }
+                            Err(e) => menu_msg = format!("cannot reach {}: {}", buf, e),
+                        }
+                        join_input = None;
+                    } else if is_key_pressed(KeyCode::Escape) {
+                        join_input = None;
+                    }
+                } else if connecting {
+                    draw_rectangle(
+                        0.0,
+                        0.0,
+                        screen_width(),
+                        screen_height(),
+                        with_alpha(BLACK, 0.5),
+                    );
+                    center_text("CONNECTING ...", ch - 10.0, 44.0, COL_UI);
+                    center_text("ESC  cancel", ch + 36.0, 22.0, with_alpha(WHITE, 0.6));
+                    if is_key_pressed(KeyCode::Escape) {
+                        role = Role::None;
+                    }
+                } else {
+                    if is_key_pressed(KeyCode::Enter) || is_mouse_button_pressed(MouseButton::Left)
+                    {
+                        game = Game::new(1, 0, 100.0, RunStats::default(), fresh_seed());
+                        mode = Mode::Playing;
+                        paused = false;
+                        set_grab(true, &mut grabbed);
+                    }
+                    if is_key_pressed(KeyCode::H) && matches!(role, Role::None) {
+                        match HostNet::bind(host_port) {
+                            Ok(hn) => {
+                                role = Role::Host(hn);
+                                game = Game::new(1, 0, 100.0, RunStats::default(), fresh_seed());
+                                game.mp = true;
+                                mode = Mode::Playing;
+                                paused = false;
+                                menu_msg.clear();
+                                set_grab(true, &mut grabbed);
+                            }
+                            Err(e) => {
+                                menu_msg = format!("cannot bind port {}: {}", host_port, e)
+                            }
+                        }
+                    }
+                    if is_key_pressed(KeyCode::J) && matches!(role, Role::None) {
+                        join_input = Some(std::env::var("CR_JOIN").unwrap_or_default());
+                    }
+                    if is_key_pressed(KeyCode::Q) || is_key_pressed(KeyCode::Escape) {
+                        break;
+                    }
                 }
             }
 
@@ -2770,6 +4211,9 @@ async fn main() {
                         hitstop = game.pending_hitstop;
                         game.pending_hitstop = 0.0;
                     }
+                } else if game.mp {
+                    // Co-op never freezes the world; the pause menu is local.
+                    game.update(dt, !in_transition, false, &sounds);
                 } else {
                     game.update(0.0, false, false, &sounds);
                 }
@@ -2808,6 +4252,24 @@ async fn main() {
                     }
                     if is_key_pressed(KeyCode::Q) {
                         last_score = Some((game.score, game.level));
+                        match &mut role {
+                            Role::Host(hn) => {
+                                for c in &hn.clients {
+                                    hn.send_to(c.addr, &Packet::Bye { id: 0 });
+                                }
+                            }
+                            Role::Client(cn) => {
+                                if let Some(id) = cn.my_id {
+                                    cn.send(&Packet::Bye { id });
+                                }
+                            }
+                            Role::None => {}
+                        }
+                        role = Role::None;
+                        game.mp = false;
+                        game.net_client = false;
+                        game.remotes.clear();
+                        game.net_status.clear();
                         paused = false;
                         mode = Mode::Menu;
                         set_grab(false, &mut grabbed);
@@ -2834,24 +4296,36 @@ async fn main() {
                         if *timer > 2.6 {
                             let (level, score, hp, stats) =
                                 (game.level + 1, game.score, (game.hp + 15.0).min(100.0), game.stats);
-                            game = Game::new(level, score, hp, stats);
+                            let mut ng = Game::new(level, score, hp, stats, fresh_seed());
+                            ng.adopt_net(&mut game);
+                            game = ng;
                             mode = Mode::Playing;
                         }
                     } else {
-                        if game.crystals.iter().all(|c| c.taken) {
+                        if !game.net_client && game.crystals.iter().all(|c| c.taken) {
                             let clear = 200 + 100 * game.level as i64;
                             let time_b = ((90.0 - game.time_in_level).max(0.0) * 5.0) as i64;
                             game.score += clear + time_b;
                             game.last_bonus = (clear, time_b);
                             mode = Mode::LevelDone(0.0);
                             play(&sounds, |s| &s.clear, 0.8);
-                        } else if game.hp <= 0.0 {
-                            game.hp = 0.0;
-                            game.dmg_flash = 1.4;
-                            last_score = Some((game.score, game.level));
-                            mode = Mode::Dead;
-                            set_grab(false, &mut grabbed);
-                            play(&sounds, |s| &s.death, 0.8);
+                        } else if game.hp <= 0.0 && !game.net_client {
+                            if game.mp {
+                                // Co-op: go down, wait for the respawn timer.
+                                if game.my_respawn_t <= 0.0 {
+                                    game.hp = 0.0;
+                                    game.my_respawn_t = 5.0;
+                                    game.dmg_flash = 1.4;
+                                    play(&sounds, |s| &s.death, 0.8);
+                                }
+                            } else {
+                                game.hp = 0.0;
+                                game.dmg_flash = 1.4;
+                                last_score = Some((game.score, game.level));
+                                mode = Mode::Dead;
+                                set_grab(false, &mut grabbed);
+                                play(&sounds, |s| &s.death, 0.8);
+                            }
                         }
                     }
                 }
@@ -2882,7 +4356,7 @@ async fn main() {
                 center_text("R  retry        ENTER  menu", chh + 70.0, 28.0, with_alpha(WHITE, 0.7));
 
                 if is_key_pressed(KeyCode::R) {
-                    game = Game::new(1, 0, 100.0, RunStats::default());
+                    game = Game::new(1, 0, 100.0, RunStats::default(), fresh_seed());
                     mode = Mode::Playing;
                     paused = false;
                     set_grab(true, &mut grabbed);
@@ -2893,11 +4367,79 @@ async fn main() {
             }
         }
 
+        // ---- network: send
+        match &mut role {
+            Role::Host(hn) => {
+                // ~30 Hz snapshots, personalized with each client's acks.
+                if frame % 2 == 0 && !hn.clients.is_empty() {
+                    hn.snap_seq = hn.snap_seq.wrapping_add(1);
+                    let phase = if matches!(mode, Mode::LevelDone(_)) { 1 } else { 0 };
+                    let mut snap = game.build_snapshot(hn.snap_seq, phase);
+                    for c in &hn.clients {
+                        snap.shot_ack = c.shot_ack;
+                        snap.echo_seq = c.echo_seq;
+                        hn.send_to(c.addr, &Packet::Snap(Box::new(snap.clone())));
+                    }
+                }
+            }
+            Role::Client(cn) => {
+                if let Some((o, d)) = game.client_shot_request.take() {
+                    cn.queue_shot(o, d);
+                }
+                if let Some(id) = cn.my_id {
+                    cn.state_seq = cn.state_seq.wrapping_add(1);
+                    let flags = (if game.my_respawn_t <= 0.0 { PF_ALIVE } else { 0 })
+                        | (if game.dash_t > 0.0 { PF_DASH } else { 0 });
+                    cn.send(&Packet::State(ClientState {
+                        id,
+                        seq: cn.state_seq,
+                        pos: game.ppos,
+                        vel: game.vel,
+                        yaw: game.yaw,
+                        pitch: game.pitch,
+                        flags,
+                        shots: cn.pending_shots.clone(),
+                    }));
+                    cn.sent_times.push_back((cn.state_seq, tnow));
+                    while cn.sent_times.len() > 240 {
+                        cn.sent_times.pop_front();
+                    }
+                }
+            }
+            Role::None => {}
+        }
+
         frame += 1;
         if shot_var == "combat" && frame == 36 {
             game.shoot(&sounds);
         }
-        if shot_mode && frame == 40 {
+        // MP screenshot scenarios: face the other player so both captures
+        // show an avatar.
+        if (shot_var == "mphost" || shot_var == "mpjoin") && !game.remotes.is_empty() {
+            let d = game.remotes[0].render_pos - game.ppos;
+            if d.length() > 0.05 {
+                game.yaw = d.y.atan2(d.x);
+                game.pitch = -0.04;
+            }
+        }
+        // ... and exercise the reliable shot channel from the client side.
+        if shot_var == "mpjoin"
+            && frame >= 120
+            && frame % 25 == 0
+            && game.shot_cd <= 0.0
+            && game.my_respawn_t <= 0.0
+        {
+            game.shoot(&sounds);
+        }
+        if shot_var == "mphost" && frame == 350 {
+            get_screen_data().export_png("/tmp/crystal_rush_host.png");
+            break;
+        }
+        if shot_var == "mpjoin" && frame == 200 {
+            get_screen_data().export_png("/tmp/crystal_rush_client.png");
+            break;
+        }
+        if shot_mode && shot_var != "mphost" && shot_var != "mpjoin" && frame == 40 {
             get_screen_data().export_png("/tmp/crystal_rush.png");
             break;
         }

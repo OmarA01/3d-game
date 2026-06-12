@@ -1,2 +1,12 @@
-target
+# Build output
+target/
+
+# Compiled binary (rebuilt from source)
 crystal-rush
+
+# Local build hacks
+.linkstubs/
+.cargo/
+
+# Editor/agent config
+.claude/
