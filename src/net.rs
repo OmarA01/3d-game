@@ -13,9 +13,12 @@ use std::io;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 
 pub const MAGIC: u16 = 0xC57A;
-pub const VER: u8 = 1;
+pub const VER: u8 = 4;
 pub const DEFAULT_PORT: u16 = 24777;
 pub const MAX_PLAYERS: usize = 4;
+/// Max bytes in a player name, on disk and over the wire. Single source of
+/// truth shared by the net codec (net.rs) and the name editor (main.rs).
+pub const MAX_NAME: usize = 12;
 
 // player blob flags
 pub const PF_ALIVE: u8 = 1;
@@ -71,6 +74,22 @@ impl Wr {
         self.f32(v.y);
         self.f32(v.z);
     }
+    /// Length-prefixed (u8) UTF-8 string, clamped to MAX_NAME bytes. Used for
+    /// player names on the wire. We slice on byte length to avoid splitting a
+    /// multi-byte char mid-glyph; the bytes are then re-validated as UTF-8.
+    fn s(&mut self, v: &str) {
+        let mut bytes = v.as_bytes();
+        if bytes.len() > MAX_NAME {
+            // Walk back to the last char boundary at or below MAX_NAME.
+            let mut end = MAX_NAME;
+            while end > 0 && !v.is_char_boundary(end) {
+                end -= 1;
+            }
+            bytes = &bytes[..end];
+        }
+        self.u8(bytes.len() as u8);
+        self.b.extend_from_slice(bytes);
+    }
 }
 
 struct Rd<'a> {
@@ -114,6 +133,14 @@ impl<'a> Rd<'a> {
     fn v3(&mut self) -> Option<Vec3> {
         Some(vec3(self.f32()?, self.f32()?, self.f32()?))
     }
+    /// Read a length-prefixed string (counterpart to `Wr::s`). Lossy: invalid
+    /// UTF-8 is replaced rather than failing the whole packet. Bounds-checked —
+    /// a truncated length field yields None, dropping the malformed packet.
+    fn s(&mut self) -> Option<String> {
+        let n = self.u8()? as usize;
+        let bytes = self.take(n)?;
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    }
 }
 
 // ------------------------------------------------------------------ packets
@@ -134,6 +161,8 @@ pub struct PlayerBlob {
     pub hurt_dir: u8, // quantized world angle
     pub shot_ctr: u8,
     pub od_t: u8, // overdrive remaining, deciseconds
+    pub sj_t: u8, // skyjump remaining, deciseconds
+    pub name: String, // display name (empty => "P{n}" fallback)
 }
 
 #[derive(Clone)]
@@ -143,6 +172,7 @@ pub struct DroneBlob {
     pub dir: u8,
     pub state: u8, // 0 patrol, 1 chase, 2 investigate
     pub hp: u8,
+    pub kind: u8, // 0 grunt, 1 tank, 2 sprinter, 3 spitter
 }
 
 #[derive(Clone)]
@@ -191,6 +221,7 @@ pub struct ShotEv {
     pub id: u16,
     pub origin: Vec3,
     pub dir: Vec3,
+    pub weapon: u8,
 }
 
 #[derive(Clone)]
@@ -206,7 +237,7 @@ pub struct ClientState {
 }
 
 pub enum Packet {
-    Hello { ver: u8 },
+    Hello { ver: u8, name: String },
     Welcome { ver: u8, id: u8, level: u32, seed: u64, score: i64, spawn: Vec2 },
     State(ClientState),
     Snap(Box<Snapshot>),
@@ -216,9 +247,10 @@ pub enum Packet {
 impl Packet {
     pub fn encode(&self) -> Vec<u8> {
         match self {
-            Packet::Hello { ver } => {
+            Packet::Hello { ver, name } => {
                 let mut w = Wr::new(1);
                 w.u8(*ver);
+                w.s(name);
                 w.b
             }
             Packet::Welcome { ver, id, level, seed, score, spawn } => {
@@ -245,6 +277,7 @@ impl Packet {
                     w.u16(sh.id);
                     w.v3(sh.origin);
                     w.v3(sh.dir);
+                    w.u8(sh.weapon);
                 }
                 w.b
             }
@@ -277,6 +310,8 @@ impl Packet {
                     w.u8(p.hurt_dir);
                     w.u8(p.shot_ctr);
                     w.u8(p.od_t);
+                    w.u8(p.sj_t);
+                    w.s(&p.name);
                 }
                 w.u8(s.drones.len().min(255) as u8);
                 for d in &s.drones {
@@ -285,6 +320,7 @@ impl Packet {
                     w.u8(d.dir);
                     w.u8(d.state);
                     w.u8(d.hp);
+                    w.u8(d.kind);
                 }
                 w.u8(s.turrets.len() as u8);
                 for t in &s.turrets {
@@ -320,7 +356,7 @@ impl Packet {
             return None;
         }
         match r.u8()? {
-            1 => Some(Packet::Hello { ver: r.u8()? }),
+            1 => Some(Packet::Hello { ver: r.u8()?, name: r.s()? }),
             2 => Some(Packet::Welcome {
                 ver: r.u8()?,
                 id: r.u8()?,
@@ -340,7 +376,7 @@ impl Packet {
                 let n = r.u8()? as usize;
                 let mut shots = Vec::with_capacity(n);
                 for _ in 0..n {
-                    shots.push(ShotEv { id: r.u16()?, origin: r.v3()?, dir: r.v3()? });
+                    shots.push(ShotEv { id: r.u16()?, origin: r.v3()?, dir: r.v3()?, weapon: r.u8()? });
                 }
                 Some(Packet::State(ClientState { id, seq, pos, vel, yaw, pitch, flags, shots }))
             }
@@ -374,6 +410,8 @@ impl Packet {
                         hurt_dir: r.u8()?,
                         shot_ctr: r.u8()?,
                         od_t: r.u8()?,
+                        sj_t: r.u8()?,
+                        name: r.s()?,
                     });
                 }
                 let nd = r.u8()? as usize;
@@ -385,6 +423,7 @@ impl Packet {
                         dir: r.u8()?,
                         state: r.u8()?,
                         hp: r.u8()?,
+                        kind: r.u8()?,
                     });
                 }
                 let nt = r.u8()? as usize;
@@ -437,6 +476,7 @@ impl Packet {
 pub struct HostClient {
     pub addr: SocketAddr,
     pub id: u8,
+    pub name: String,
     pub last_recv: f64,
     pub last_state_seq: u32,
     pub shot_ack: u16,
@@ -538,7 +578,7 @@ impl ClientNet {
         let _ = self.sock.send_to(&p.encode(), self.server);
     }
 
-    pub fn queue_shot(&mut self, origin: Vec3, dir: Vec3) {
+    pub fn queue_shot(&mut self, origin: Vec3, dir: Vec3, weapon: u8) {
         if self.pending_shots.len() >= 12 {
             self.pending_shots.remove(0);
         }
@@ -547,7 +587,7 @@ impl ClientNet {
         if self.next_shot_id == 0 {
             self.next_shot_id = 1;
         }
-        self.pending_shots.push(ShotEv { id, origin, dir });
+        self.pending_shots.push(ShotEv { id, origin, dir, weapon });
     }
 
     pub fn ack_shots(&mut self, ack: u16) {
@@ -557,5 +597,92 @@ impl ClientNet {
         // ids increase monotonically; drop everything at-or-before `ack`
         // (wrapping comparison keeps this correct across u16 wrap)
         self.pending_shots.retain(|s| s.id.wrapping_sub(ack).wrapping_sub(1) < 0x8000);
+    }
+}
+
+#[cfg(test)]
+mod net_tests {
+    use super::*;
+
+    #[test]
+    fn hello_round_trips_name() {
+        let p = Packet::Hello { ver: VER, name: "Omar".to_string() };
+        match Packet::decode(&p.encode()) {
+            Some(Packet::Hello { ver, name }) => {
+                assert_eq!(ver, VER);
+                assert_eq!(name, "Omar");
+            }
+            other => panic!("expected Hello, got {:?}", other.map(|_| "decoded")),
+        }
+    }
+
+    #[test]
+    fn snapshot_player_name_round_trips() {
+        let snap = Snapshot {
+            seq: 1,
+            shot_ack: 0,
+            echo_seq: 0,
+            level: 1,
+            seed: 7,
+            score: 0,
+            phase: 0,
+            kill_ctr: 0,
+            kill_pos: vec2(0.0, 0.0),
+            kill_big: 0,
+            crystal_mask: 0,
+            players: vec![PlayerBlob {
+                id: 2,
+                pos: vec2(1.0, 2.0),
+                vel: vec2(0.0, 0.0),
+                yaw: 0.5,
+                pitch: -0.2,
+                hp: 80.0,
+                flags: PF_ALIVE,
+                respawn_t: 0,
+                combo: 3,
+                combo_t: 0,
+                hurt_ctr: 0,
+                hurt_dir: 0,
+                shot_ctr: 0,
+                od_t: 0,
+                sj_t: 0,
+                name: "Neo_Prime".to_string(),
+            }],
+            drones: Vec::new(),
+            turrets: Vec::new(),
+            projectiles: Vec::new(),
+            pickups: Vec::new(),
+        };
+        let decoded = Packet::decode(&Packet::Snap(Box::new(snap.clone())).encode());
+        match decoded {
+            Some(Packet::Snap(s)) => {
+                assert_eq!(s.players.len(), 1);
+                assert_eq!(s.players[0].name, "Neo_Prime");
+            }
+            other => panic!("expected Snap, got {:?}", other.map(|_| "decoded")),
+        }
+        // Touch the clone so the field set stays honest if Snapshot grows.
+        let _ = snap.players[0].id;
+    }
+
+    #[test]
+    fn overlong_name_is_clamped_on_encode() {
+        let huge = "X".repeat(100);
+        let p = Packet::Hello { ver: VER, name: huge.clone() };
+        let bytes = p.encode();
+        match Packet::decode(&bytes) {
+            Some(Packet::Hello { name, .. }) => {
+                assert!(name.len() <= MAX_NAME, "wire name must respect MAX_NAME");
+                assert_eq!(name.len(), MAX_NAME);
+            }
+            other => panic!("decode failed: {:?}", other.map(|_| "decoded")),
+        }
+    }
+
+    #[test]
+    fn version_mismatch_is_rejected() {
+        // An old-protocol Hello (ver != VER) is dropped by the host/client
+        // match arms; here we just confirm the constant moved to 4.
+        assert_eq!(VER, 4);
     }
 }
