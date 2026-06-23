@@ -42,6 +42,11 @@ const DASH_CD: f32 = 1.4;
 const SHOT_CD: f32 = 0.22;
 const SHOT_RANGE: f32 = 35.0;
 
+// Player rockets are traveling shells (reusing the turret-projectile pipeline).
+const ROCKET_SPEED: f32 = 18.0; // world units / second
+const ROCKET_R: f32 = 0.18; // shell contact radius (detonates near an enemy)
+const ROCKET_TTL: f32 = 3.0; // backstop range; maze walls end the flight sooner
+
 const FOG_MAX: f32 = 26.0;
 const BASE_FOV: f32 = 62.0;
 
@@ -854,6 +859,14 @@ struct PostStack {
     bright: Option<Material>,
     blur: Option<Material>,
     comp: Option<Material>,
+    // When true, behave as if post-processing is unavailable: the 3D scene is
+    // drawn straight to the screen (depth-tested against the main framebuffer)
+    // and the bloom passes are skipped. Forced on for the browser, where the
+    // off-screen scene render target can't be created (miniquad allocates its
+    // depth attachment with an internal format that's invalid under WebGL2, so
+    // the FBO is incomplete and the scene would render black). Native leaves
+    // this false and gets the full pipeline.
+    disabled: bool,
 }
 
 impl PostStack {
@@ -895,11 +908,21 @@ impl PostStack {
                 UniformDesc::new("Vignette", UniformType::Float1),
             ],
         );
-        PostStack { w, h, scene, bloom_a, bloom_b, bright, blur, comp }
+        // Browser: skip the off-screen pipeline (see `disabled` above). On
+        // native it stays enabled.
+        let disabled = cfg!(target_arch = "wasm32");
+        PostStack { w, h, scene, bloom_a, bloom_b, bright, blur, comp, disabled }
     }
 
     fn make_targets(w: u32, h: u32) -> (RenderTarget, Vec<RenderTarget>, Vec<RenderTarget>) {
-        let scene = render_target_ex(w, h, RenderTargetParams { sample_count: 1, depth: true });
+        // The scene target needs a depth attachment for the 3D pass — but on
+        // wasm a depth render target is broken (invalid WebGL2 internalformat)
+        // and we don't use this target there anyway (post-processing is
+        // disabled, the scene draws straight to screen). So skip depth on wasm
+        // to avoid allocating an incomplete FBO and spamming GL errors.
+        let want_depth = !cfg!(target_arch = "wasm32");
+        let scene =
+            render_target_ex(w, h, RenderTargetParams { sample_count: 1, depth: want_depth });
         scene.texture.set_filter(FilterMode::Linear);
         let mut a = Vec::new();
         let mut b = Vec::new();
@@ -917,7 +940,7 @@ impl PostStack {
     }
 
     fn active(&self) -> bool {
-        self.bright.is_some() && self.blur.is_some() && self.comp.is_some()
+        !self.disabled && self.bright.is_some() && self.blur.is_some() && self.comp.is_some()
     }
 
     // Recreate the targets if the window size changed (no per-frame alloc).
@@ -1450,10 +1473,23 @@ struct Turret {
     hit_flash: f32,
 }
 
+// `Bolt` = a hostile turret shot (hits players). `Rocket` = a friendly player
+// shell (hits drones/turrets, detonates an AoE on impact). Both ride the same
+// host-authoritative Vec + ProjBlob snapshot path; clients only render them.
+#[derive(Clone, Copy, PartialEq)]
+enum ProjKind {
+    Bolt,
+    Rocket,
+}
+
 struct Projectile {
     pos: Vec2,
     vel: Vec2,
     ttl: f32,
+    kind: ProjKind,
+    dmg: i32,             // rocket only (bolts keep the hardcoded hit damage)
+    aoe: f32,             // rocket splash radius (0 for bolts)
+    owner: Option<usize>, // rocket: firing player (None = local, Some = remote idx)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1497,6 +1533,7 @@ struct Tracer {
     from: Vec3,
     to: Vec3,
     ttl: f32,
+    weapon: Weapon, // drives per-weapon rendering (railgun = thick beam, else = bullet line)
 }
 
 struct Explosion {
@@ -2369,21 +2406,17 @@ impl Game {
     fn predict_fire(&mut self, weapon: Weapon, eye: Vec3, dir: Vec3, muzzle: Vec3) {
         if weapon.piercing() {
             let wall_t = self.wall_hit(eye, dir);
-            self.tracers.push(Tracer { from: muzzle, to: eye + dir * wall_t, ttl: 0.06 });
+            self.tracers.push(Tracer { from: muzzle, to: eye + dir * wall_t, ttl: 0.14, weapon: Weapon::Railgun });
             if !self.scan_targets_pierce(eye, dir).1.is_empty() {
                 self.hitmark_t = 0.12;
             }
             return;
         }
         if weapon.aoe_radius() > 0.0 {
-            let (wall_t, best) = self.scan_targets(eye, dir);
-            let hit_t = best.map_or(wall_t, |(_, t, _)| t);
-            let hit_p = eye + dir * hit_t;
-            self.tracers.push(Tracer { from: muzzle, to: hit_p, ttl: 0.06 });
-            self.explosions.push(Explosion { pos: hit_p, t: 0.0, big: true });
-            if best.is_some() {
-                self.hitmark_t = 0.12;
-            }
+            // Rockets are host-authoritative traveling shells — the client renders
+            // the host's shell from the snapshot (~1 RTT later), exactly like turret
+            // bolts. No local prediction: a predicted detonation could disagree with
+            // the server's AoE, so we fire-and-forget and let the host resolve it.
             return;
         }
         let mut any = false;
@@ -2391,7 +2424,7 @@ impl Game {
             let pd = if weapon.spread() > 0.0 { jitter_dir(dir, weapon.spread()) } else { dir };
             let (wall_t, best) = self.scan_targets(eye, pd);
             let hit_t = best.map_or(wall_t, |(_, t, _)| t);
-            self.tracers.push(Tracer { from: muzzle, to: eye + pd * hit_t, ttl: 0.06 });
+            self.tracers.push(Tracer { from: muzzle, to: eye + pd * hit_t, ttl: 0.06, weapon });
             any |= best.is_some();
         }
         if any {
@@ -2441,7 +2474,7 @@ impl Game {
         }
         if weapon.piercing() {
             let (wall_t, hits) = self.scan_targets_pierce(origin, dir);
-            self.tracers.push(Tracer { from, to: origin + dir * wall_t, ttl: 0.06 });
+            self.tracers.push(Tracer { from, to: origin + dir * wall_t, ttl: 0.14, weapon: Weapon::Railgun });
             if local && !hits.is_empty() {
                 self.stats.shots_hit += 1; // railgun: one trigger pull = one shot
             }
@@ -2458,26 +2491,30 @@ impl Game {
                 self.damage_turret(i, weapon.damage(), shooter, snd);
             }
         } else if weapon.aoe_radius() > 0.0 {
-            let (wall_t, best) = self.scan_targets(origin, dir);
-            let hit_t = best.map_or(wall_t, |(_, t, _)| t);
-            let hit_p = origin + dir * hit_t;
-            self.tracers.push(Tracer { from, to: hit_p, ttl: 0.06 });
-            self.explosions.push(Explosion { pos: hit_p, t: 0.0, big: true });
-            self.burst(hit_p, weapon.color(), 30, 7.0);
+            // Rockets are traveling shells: spawn a friendly projectile; the
+            // physics loop flies it out and detonates the AoE on impact. No tracer
+            // is spawned — the shell itself (plus its smoke trail) is the visual.
+            let horiz = vec2(dir.x, dir.z).normalize_or_zero();
+            self.projectiles.push(Projectile {
+                pos: vec2(origin.x, origin.z) + horiz * 0.4,
+                vel: horiz * ROCKET_SPEED,
+                ttl: ROCKET_TTL,
+                kind: ProjKind::Rocket,
+                dmg: weapon.damage(),
+                aoe: weapon.aoe_radius(),
+                owner: shooter,
+            });
             if local {
-                self.shake = (self.shake + 0.3).min(1.0);
-                if best.is_some() {
-                    self.stats.shots_hit += 1; // rocket: direct-impact counts as a hit
-                }
+                self.shake = (self.shake + 0.15).min(1.0);
+                // shots_fired was already counted above; shots_hit is awarded on detonation.
             }
-            self.aoe_damage(hit_p, weapon.aoe_radius(), weapon.damage(), shooter, snd);
         } else {
             for _ in 0..weapon.pellets() {
                 let pd = if weapon.spread() > 0.0 { jitter_dir(dir, weapon.spread()) } else { dir };
                 let (wall_t, best) = self.scan_targets(origin, pd);
                 let hit_t = best.map_or(wall_t, |(_, t, _)| t);
                 let hit_p = origin + pd * hit_t;
-                self.tracers.push(Tracer { from, to: hit_p, ttl: 0.06 });
+                self.tracers.push(Tracer { from, to: hit_p, ttl: 0.06, weapon });
                 if local && best.is_some() {
                     self.stats.shots_hit += 1; // rifle / shotgun: per-pellet accuracy
                 }
@@ -3209,7 +3246,10 @@ impl Game {
 
             for &(ri, tpos, _, vuln) in &targets {
                 if vuln && (tpos - d.pos).length() < PLAYER_R + radius + 0.05 {
-                    contact_hits.push((ri, (tpos - d.pos).normalize_or_zero(), damage));
+                    // Direction points at the source (drone → player→drone), matching
+                    // the turret-projectile convention so hurt()'s `vel += -from_dir`
+                    // shoves the player AWAY from the drone instead of into it.
+                    contact_hits.push((ri, (d.pos - tpos).normalize_or_zero(), damage));
                 }
             }
         }
@@ -3224,6 +3264,40 @@ impl Game {
                     let push = d / l * (rsum - l) * 0.5;
                     self.drones[i].pos -= push;
                     self.drones[j].pos += push;
+                }
+            }
+        }
+
+        // Player↔drone separation: keep a body-radius gap so a single drone can
+        // never sit on the player's exact position. Without this a `Chase` drone
+        // (goal = the player's exact pos) glued itself at distance 0, zeroing the
+        // knockback direction and pinning the player. One-sided — only the drone
+        // yields, so the player's wall-resolved position isn't shoved into a wall.
+        let mut player_centers: Vec<(Vec2, f32)> = Vec::new();
+        if active && self.my_respawn_t <= 0.0 {
+            player_centers.push((self.ppos, PLAYER_R));
+        }
+        for r in &self.remotes {
+            if r.alive {
+                player_centers.push((r.pos, PLAYER_R));
+            }
+        }
+        if !player_centers.is_empty() {
+            for d in self.drones.iter_mut() {
+                let rsum = PLAYER_R + d.kind.radius();
+                for &(pc, _pr) in &player_centers {
+                    let diff = d.pos - pc;
+                    let l = diff.length();
+                    if l > 1e-4 {
+                        if l < rsum {
+                            d.pos = pc + diff / l * rsum;
+                        }
+                    } else {
+                        // exactly overlapping: shove out along the facing dir so
+                        // we never divide by zero (fallback to +x).
+                        let dir = if d.dir.length_squared() > 1e-6 { d.dir } else { vec2(1.0, 0.0) };
+                        d.pos = pc + dir * rsum;
+                    }
                 }
             }
         }
@@ -3267,35 +3341,100 @@ impl Game {
                 pos: pos + dir * 0.5,
                 vel: dir * 7.5,
                 ttl: 4.0,
+                kind: ProjKind::Bolt,
+                dmg: 0,
+                aoe: 0.0,
+                owner: None,
             });
             let vol = (1.0 - (pos - ppos).length() / 20.0).clamp(0.1, 1.0) * 0.55;
             play(snd, |s| &s.turret, vol);
         }
 
-        // ----- projectiles
+        // ----- projectiles (turret bolts hit players; player rockets hit
+        // drones/turrets and detonate an AoE on impact).
         let mut proj_hits: Vec<(usize, Vec2)> = Vec::new();
         let mut proj_particles: Vec<Vec3> = Vec::new();
+        // Enemy contact points for rocket detonation (drones + alive turrets),
+        // pre-built so the retain_mut closure doesn't reborrow `self`.
+        let enemy_contact: Vec<(Vec2, f32)> = self
+            .drones
+            .iter()
+            .map(|d| (d.pos, d.kind.radius()))
+            .chain(self.turrets.iter().filter(|t| t.alive).map(|t| (t.pos, 0.4)))
+            .collect();
+        let mut detonations: Vec<(Vec2, i32, f32, Option<usize>)> = Vec::new();
+        let mut smoke: Vec<Vec2> = Vec::new();
         self.projectiles.retain_mut(|p| {
             p.pos += p.vel * dt;
             p.ttl -= dt;
             let (cx, cy) = maze.world_to_cell(p.pos);
-            if maze.is_wall(cx, cy) || p.ttl <= 0.0 {
-                proj_particles.push(vec3(p.pos.x, 1.0, p.pos.y));
-                return false;
-            }
-            for &(ri, tpos, _, vuln) in &targets {
-                if (p.pos - tpos).length() < 0.16 + PLAYER_R {
-                    if vuln {
-                        proj_hits.push((ri, p.vel.normalize_or_zero() * -1.0));
+            match p.kind {
+                ProjKind::Bolt => {
+                    if maze.is_wall(cx, cy) || p.ttl <= 0.0 {
+                        proj_particles.push(vec3(p.pos.x, 1.0, p.pos.y));
+                        return false;
                     }
-                    proj_particles.push(vec3(p.pos.x, 1.0, p.pos.y));
-                    return false;
+                    for &(ri, tpos, _, vuln) in &targets {
+                        if (p.pos - tpos).length() < 0.16 + PLAYER_R {
+                            if vuln {
+                                proj_hits.push((ri, p.vel.normalize_or_zero() * -1.0));
+                            }
+                            proj_particles.push(vec3(p.pos.x, 1.0, p.pos.y));
+                            return false;
+                        }
+                    }
+                    true
+                }
+                ProjKind::Rocket => {
+                    // Trail smoke each frame the shell is in flight.
+                    smoke.push(p.pos);
+                    if maze.is_wall(cx, cy) || p.ttl <= 0.0 {
+                        detonations.push((p.pos, p.dmg, p.aoe, p.owner));
+                        return false;
+                    }
+                    // Detonate on near-contact with any enemy so the burst lands on
+                    // the target's surface rather than flying through to a wall.
+                    for &(ep, er) in &enemy_contact {
+                        if (p.pos - ep).length() < ROCKET_R + er {
+                            detonations.push((p.pos, p.dmg, p.aoe, p.owner));
+                            return false;
+                        }
+                    }
+                    true
                 }
             }
-            true
         });
         for pp in proj_particles {
             self.burst(pp, COL_OVERDRIVE, 7, 3.0);
+        }
+        // Rocket detonations: explosion FX + splash damage + skill telemetry.
+        for (dpos, dmg, aoe, owner) in detonations {
+            let hit_any = enemy_contact
+                .iter()
+                .any(|&(ep, er)| (ep - dpos).length() <= aoe + er);
+            let p3 = vec3(dpos.x, 1.0, dpos.y);
+            self.explosions.push(Explosion { pos: p3, t: 0.0, big: true });
+            self.burst(p3, Weapon::Rocket.color(), 30, 7.0);
+            self.aoe_damage(p3, aoe, dmg, owner, snd);
+            if owner.is_none() {
+                // Local player's rocket: screenshake + accuracy telemetry.
+                self.shake = (self.shake + 0.3).min(1.0);
+                if hit_any {
+                    self.stats.shots_hit += 1;
+                }
+            }
+        }
+        // Smoke-trail puffs (rendered by the particle loop).
+        for s in smoke {
+            self.particles.push(Particle {
+                pos: vec3(s.x, 1.0 - gen_range(0.0, 0.2), s.y),
+                vel: vec3(gen_range(-0.3, 0.3), gen_range(0.2, 0.6), gen_range(-0.3, 0.3)),
+                life: 0.45,
+                max: 0.45,
+                size: gen_range(0.10, 0.18),
+                color: Color::new(0.85, 0.78, 0.70, 0.5),
+                grav: 0.0,
+            });
         }
         for (ri, dir, dmg) in contact_hits {
             if ri == usize::MAX {
@@ -3540,7 +3679,14 @@ impl Game {
             projectiles: self
                 .projectiles
                 .iter()
-                .map(|p| ProjBlob { pos: p.pos, vel: p.vel })
+                .map(|p| ProjBlob {
+                    pos: p.pos,
+                    vel: p.vel,
+                    kind: match p.kind {
+                        ProjKind::Bolt => 0,
+                        ProjKind::Rocket => 1,
+                    },
+                })
                 .collect(),
             pickups: self
                 .pickups
@@ -3794,6 +3940,7 @@ impl Game {
                     from: eye + dir * 0.4,
                     to: eye + dir * hit_t,
                     ttl: 0.06,
+                    weapon: Weapon::Rifle,
                 });
                 play(snd, |s| &s.shoot, vol);
             }
@@ -3873,7 +4020,17 @@ impl Game {
         self.projectiles = b
             .projectiles
             .iter()
-            .map(|p| Projectile { pos: p.pos + p.vel * age, vel: p.vel, ttl: 1.0 })
+            .map(|p| Projectile {
+                pos: p.pos + p.vel * age,
+                vel: p.vel,
+                ttl: 1.0,
+                kind: if p.kind == 1 { ProjKind::Rocket } else { ProjKind::Bolt },
+                // Payload is irrelevant on a client — it only renders + dead-reckons;
+                // damage is host-authoritative.
+                dmg: 0,
+                aoe: 0.0,
+                owner: None,
+            })
             .collect();
 
         // Turret aim interpolation; alive/hp arrive via apply_snapshot.
@@ -3971,11 +4128,15 @@ impl Game {
             });
         }
         for p in &self.projectiles {
+            let (color, radius, intensity) = match p.kind {
+                ProjKind::Rocket => (vec3(1.0, 0.55, 0.25), 3.6, 1.6),
+                ProjKind::Bolt => (vec3(1.0, 0.3, 0.9), 4.5, 1.2),
+            };
             lights.push(LightSrc {
                 pos: vec3(p.pos.x, 1.0, p.pos.y),
-                color: vec3(1.0, 0.3, 0.9),
-                radius: 4.5,
-                intensity: 1.2,
+                color,
+                radius,
+                intensity,
             });
         }
         for p in self.pickups.iter().filter(|p| !p.taken) {
@@ -4385,7 +4546,16 @@ impl Game {
 
         // Projectile cores.
         for p in &self.projectiles {
-            draw_sphere(vec3(p.pos.x, 1.0, p.pos.y), 0.13, None, Color::new(1.0, 0.6, 1.0, 1.0));
+            match p.kind {
+                ProjKind::Rocket => {
+                    // Hot rocket shell: orange body with a white-hot core.
+                    draw_sphere(vec3(p.pos.x, 1.0, p.pos.y), 0.15, None, Color::new(1.0, 0.55, 0.25, 1.0));
+                    draw_sphere(vec3(p.pos.x, 1.0, p.pos.y), 0.08, None, Color::new(1.0, 0.95, 0.8, 1.0));
+                }
+                ProjKind::Bolt => {
+                    draw_sphere(vec3(p.pos.x, 1.0, p.pos.y), 0.13, None, Color::new(1.0, 0.6, 1.0, 1.0));
+                }
+            }
         }
 
         // Pickups.
@@ -4429,13 +4599,22 @@ impl Game {
 
         // Tracers.
         for tr in &self.tracers {
-            let a = (tr.ttl / 0.06).clamp(0.0, 1.0);
-            draw_line_3d(tr.from, tr.to, Color::new(0.6, 1.0, 1.0, a));
-            draw_line_3d(
-                tr.from + vec3(0.0, 0.01, 0.0),
-                tr.to,
-                Color::new(0.2, 0.6, 1.0, a * 0.5),
-            );
+            if tr.weapon == Weapon::Railgun {
+                // Railgun: a hot energy beam — bright white core + cyan overlay.
+                // The glow pass adds a fat additive bloom along the path.
+                let a = (tr.ttl / 0.14).clamp(0.0, 1.0);
+                draw_line_3d(tr.from, tr.to, Color::new(1.0, 1.0, 1.0, a));
+                draw_line_3d(tr.from, tr.to, Color::new(0.55, 0.92, 1.0, a * 0.85));
+            } else {
+                // Rifle / shotgun: the classic thin cyan tracer.
+                let a = (tr.ttl / 0.06).clamp(0.0, 1.0);
+                draw_line_3d(tr.from, tr.to, Color::new(0.6, 1.0, 1.0, a));
+                draw_line_3d(
+                    tr.from + vec3(0.0, 0.01, 0.0),
+                    tr.to,
+                    Color::new(0.2, 0.6, 1.0, a * 0.5),
+                );
+            }
         }
 
         // Particles.
@@ -4480,7 +4659,22 @@ impl Game {
                 glow(vec3(tr.pos.x, 1.1, tr.pos.y), 1.2, Color::new(1.0, 0.25, 0.85, 0.30));
             }
             for p in &self.projectiles {
-                glow(vec3(p.pos.x, 1.0, p.pos.y), 1.1, Color::new(1.0, 0.4, 0.95, 0.6));
+                let (size, c) = match p.kind {
+                    ProjKind::Rocket => (1.3, Color::new(1.0, 0.5, 0.25, 0.8)),
+                    ProjKind::Bolt => (1.1, Color::new(1.0, 0.4, 0.95, 0.6)),
+                };
+                glow(vec3(p.pos.x, 1.0, p.pos.y), size, c);
+            }
+            // Railgun beams: a chain of additive glows along the path reads as a
+            // fat glowing rail once the bloom pipeline expands it.
+            for tr in self.tracers.iter().filter(|tr| tr.weapon == Weapon::Railgun) {
+                let a = (tr.ttl / 0.14).clamp(0.0, 1.0);
+                const N: i32 = 5;
+                for k in 0..N {
+                    let f = k as f32 / (N - 1) as f32;
+                    let pt = tr.from * (1.0 - f) + tr.to * f;
+                    glow(pt, 0.9, with_alpha(Weapon::Railgun.color(), 0.45 * a));
+                }
             }
             for p in self.pickups.iter().filter(|p| !p.taken) {
                 let py = 0.55 + (t * 2.2 + p.phase).sin() * 0.10;
@@ -4545,7 +4739,11 @@ impl Game {
                 puddle(d.pos.x, d.pos.y, 2.4, c);
             }
             for p in &self.projectiles {
-                puddle(p.pos.x, p.pos.y, 1.8, Color::new(1.0, 0.4, 0.95, 0.32));
+                let c = match p.kind {
+                    ProjKind::Rocket => Color::new(1.0, 0.45, 0.25, 0.30),
+                    ProjKind::Bolt => Color::new(1.0, 0.4, 0.95, 0.32),
+                };
+                puddle(p.pos.x, p.pos.y, 1.8, c);
             }
             for p in self.pickups.iter().filter(|p| !p.taken) {
                 let c = match p.kind {
@@ -5035,6 +5233,9 @@ enum Role {
 enum MenuScreen {
     Root,
     Name(String),
+    // The join-by-IP screen is native LAN co-op only; the browser build has no
+    // UDP client, so the variant isn't constructed there.
+    #[cfg(not(target_arch = "wasm32"))]
     Join(String),
     Career,
     Settings,
@@ -5047,11 +5248,25 @@ impl Default for MenuScreen {
     }
 }
 
-/// Root menu entries, in display/selection order. Index == `menu_sel` value.
+/// Root menu entries, in display/selection order. Activation matches on the
+/// entry string (not a fixed index) so the list can differ per target.
+/// Native includes the IP-based LAN co-op items; the browser omits them — a
+/// wasm build can't open UDP sockets (online co-op arrives later over
+/// WebSockets), so showing HOST/JOIN there would only dead-end.
+#[cfg(not(target_arch = "wasm32"))]
 const MENU_ITEMS: &[&str] = &[
     "PLAY",
     "HOST CO-OP",
     "JOIN CO-OP",
+    "PILOT NAME",
+    "CAREER",
+    "SETTINGS",
+    "CONTROLS",
+    "QUIT",
+];
+#[cfg(target_arch = "wasm32")]
+const MENU_ITEMS: &[&str] = &[
+    "PLAY",
     "PILOT NAME",
     "CAREER",
     "SETTINGS",
@@ -5139,9 +5354,10 @@ fn sanitize_name(raw: &str) -> String {
 }
 
 impl PilotLedger {
-    /// Where the save lives. `$CRYSTAL_RUSH_DIR` overrides everything; otherwise
-    /// the platform config dir, falling back to the working directory. We only
-    /// create the parent directory lazily on save.
+    /// Where the save lives (native only). `$CRYSTAL_RUSH_DIR` overrides
+    /// everything; otherwise the platform config dir, falling back to the
+    /// working directory. We only create the parent directory lazily on save.
+    #[cfg(not(target_arch = "wasm32"))]
     fn path() -> std::path::PathBuf {
         use std::path::PathBuf;
         if let Ok(dir) = std::env::var("CRYSTAL_RUSH_DIR") {
@@ -5165,15 +5381,31 @@ impl PilotLedger {
         }
     }
 
-    /// Read the ledger from disk. Any error (missing file, bad data) yields a
-    /// default ledger — play is never blocked by a broken save.
+    /// Read the ledger. Any error (missing/bad data) yields a default ledger —
+    /// play is never blocked by a broken save. Native reads `pilot.sav` from
+    /// disk; in the browser it reads the `pilot` key from localStorage (via
+    /// quad-storage), so the same serialized text round-trips on both.
     fn load() -> PilotLedger {
         if std::env::var("CR_NOLEDGER").is_ok() {
             return PilotLedger::default();
         }
-        Self::load_from(&Self::path())
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Self::load_from(&Self::path())
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            match quad_storage::STORAGE.lock() {
+                Ok(s) => match s.get("pilot") {
+                    Some(text) => Self::parse(&text),
+                    None => PilotLedger::default(),
+                },
+                Err(_) => PilotLedger::default(),
+            }
+        }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn load_from(path: &std::path::Path) -> PilotLedger {
         match std::fs::read_to_string(path) {
             Ok(s) => Self::parse(&s),
@@ -5253,15 +5485,27 @@ impl PilotLedger {
         )
     }
 
-    /// Atomically persist the ledger. Best-effort: failures are logged and
-    /// swallowed so a read-only disk can never crash the game.
+    /// Persist the ledger. Best-effort: failures are logged/swallowed so a
+    /// read-only disk (native) or unavailable storage (browser) can never
+    /// crash the game. Native writes `pilot.sav` atomically; the browser writes
+    /// the serialized text to the `pilot` localStorage key.
     fn save(&self) {
         if std::env::var("CR_NOLEDGER").is_ok() {
             return;
         }
-        self.save_to(&Self::path());
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.save_to(&Self::path());
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            if let Ok(mut s) = quad_storage::STORAGE.lock() {
+                s.set("pilot", &self.serialize());
+            }
+        }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn save_to(&self, path: &std::path::Path) {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -5715,11 +5959,31 @@ fn client_pump(
 }
 
 fn window_conf() -> Conf {
+    // Native desktop GL handles MSAA + the depth render target fine.
+    #[cfg(not(target_arch = "wasm32"))]
+    let (sample_count, webgl_version) = (2, macroquad::miniquad::conf::WebGLVersion::WebGL1);
+    // Browser: WebGL2, no MSAA. NOTE: a depth render target (the PostStack
+    // scene FBO uses depth:true) currently renders the 3D scene black in the
+    // browser — miniquad allocates the depth texture with the unsized internal
+    // format GL_DEPTH_COMPONENT, illegal under GLES3/WebGL2, so the FBO is
+    // incomplete (2D UI still draws, hence "menu text over black"). WebGL1
+    // accepts that depth call but then miniquad's framebuffer blit uses
+    // readBuffer/READ_FRAMEBUFFER which don't exist on WebGL1 — so neither GL
+    // version works out-of-the-box. The real fix is in how the scene depth is
+    // allocated (see plan); this stays WebGL2 so depth is the *only* remaining
+    // browser issue.
+    #[cfg(target_arch = "wasm32")]
+    let (sample_count, webgl_version) = (1, macroquad::miniquad::conf::WebGLVersion::WebGL2);
+
     Conf {
         window_title: "Crystal Rush".to_owned(),
         window_width: 1280,
         window_height: 720,
-        sample_count: 2,
+        sample_count,
+        platform: macroquad::miniquad::conf::Platform {
+            webgl_version,
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
@@ -5790,6 +6054,8 @@ async fn main() {
         auto_join = Some("127.0.0.1:24788".to_string());
         auto_host = None;
     }
+    // Default host port for the menu's HOST CO-OP action (native LAN only).
+    #[cfg(not(target_arch = "wasm32"))]
     let host_port = auto_host.unwrap_or(DEFAULT_PORT);
 
     let seed0: u64 = if shot_mode { 12345 } else { fresh_seed() };
@@ -6032,6 +6298,9 @@ async fn main() {
                     let mut next_screen: Option<MenuScreen> = None;
                     // One-shot action flags the root can request.
                     let mut do_play = false;
+                    // Set only by the native LAN co-op paths; the browser build
+                    // has no UDP host, so it's never written there.
+                    #[cfg(not(target_arch = "wasm32"))]
                     let mut do_host = false;
                     match &mut menu_screen {
                         MenuScreen::Root => {
@@ -6067,26 +6336,33 @@ async fn main() {
                             let activate = is_key_pressed(KeyCode::Enter)
                                 || is_mouse_button_pressed(MouseButton::Left);
                             if activate {
-                                match menu_sel {
-                                    0 => do_play = true,
-                                    1 if matches!(role, Role::None) => do_host = true,
-                                    2 if matches!(role, Role::None) => {
+                                match MENU_ITEMS[menu_sel] {
+                                    "PLAY" => do_play = true,
+                                    #[cfg(not(target_arch = "wasm32"))]
+                                    "HOST CO-OP" if matches!(role, Role::None) => do_host = true,
+                                    #[cfg(not(target_arch = "wasm32"))]
+                                    "JOIN CO-OP" if matches!(role, Role::None) => {
                                         next_screen = Some(MenuScreen::Join(
                                             std::env::var("CR_JOIN").unwrap_or_default(),
                                         ));
                                     }
-                                    3 => next_screen = Some(MenuScreen::Name(ledger.name.clone())),
-                                    4 => next_screen = Some(MenuScreen::Career),
-                                    5 => next_screen = Some(MenuScreen::Settings),
-                                    6 => next_screen = Some(MenuScreen::Controls),
-                                    7 => break,
+                                    "PILOT NAME" => {
+                                        next_screen = Some(MenuScreen::Name(ledger.name.clone()))
+                                    }
+                                    "CAREER" => next_screen = Some(MenuScreen::Career),
+                                    "SETTINGS" => next_screen = Some(MenuScreen::Settings),
+                                    "CONTROLS" => next_screen = Some(MenuScreen::Controls),
+                                    "QUIT" => break,
                                     _ => {}
                                 }
                             }
                             // Legacy one-key shortcuts (muscle memory + CR_JOIN).
+                            // Native only — the browser build has no UDP co-op.
+                            #[cfg(not(target_arch = "wasm32"))]
                             if is_key_pressed(KeyCode::H) && matches!(role, Role::None) {
                                 do_host = true;
                             }
+                            #[cfg(not(target_arch = "wasm32"))]
                             if is_key_pressed(KeyCode::J) && matches!(role, Role::None) {
                                 next_screen = Some(MenuScreen::Join(
                                     std::env::var("CR_JOIN").unwrap_or_default(),
@@ -6142,6 +6418,7 @@ async fn main() {
                                 next_screen = Some(MenuScreen::Root);
                             }
                         }
+                        #[cfg(not(target_arch = "wasm32"))]
                         MenuScreen::Join(buf) => {
                             draw_rectangle(
                                 0.0,
@@ -6264,6 +6541,7 @@ async fn main() {
                         paused = false;
                         set_grab(true, &mut grabbed);
                     }
+                    #[cfg(not(target_arch = "wasm32"))]
                     if do_host {
                         match HostNet::bind(host_port) {
                             Ok(hn) => {

@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+    <title>Crystal Rush</title>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: #05060a;
+            color: #7fdfff;
+            font-family: ui-monospace, "Cascadia Code", Menlo, Consolas, monospace;
+        }
+        /* The game canvas fills the viewport. miniquad's bundle looks it up by
+           the id #glcanvas, so that id is mandatory. tabindex makes it
+           focusable so keyboard + pointer-lock work on first click. */
+        #glcanvas {
+            display: block;
+            width: 100vw;
+            height: 100vh;
+            outline: none;
+            /* Crisp pixels rather than blurry upscaling. */
+            image-rendering: pixelated;
+        }
+        /* Loading / hint overlay, removed once the wasm starts running. */
+        #overlay {
+            position: fixed;
+            inset: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 0.6em;
+            pointer-events: none;
+            background: #05060a;
+            transition: opacity 0.5s ease;
+        }
+        #overlay h1 {
+            margin: 0;
+            font-size: clamp(28px, 6vw, 64px);
+            letter-spacing: 0.18em;
+            color: #aef3ff;
+            text-shadow: 0 0 18px rgba(80, 200, 255, 0.6);
+        }
+        #overlay p { margin: 0; opacity: 0.7; font-size: clamp(12px, 2vw, 16px); }
+        #overlay .dim { opacity: 0.45; }
+    </style>
+</head>
+<body>
+    <!-- Explicit initial drawing-buffer size. Without it the canvas starts at
+         0×0, so miniquad's first frames allocate zero-size render-target
+         attachments (the post-processing FBOs), spamming
+         GL_INVALID_FRAMEBUFFER_OPERATION until CSS layout gives it a size.
+         Seeding a real size avoids that transient; CSS still scales it to the
+         viewport and miniquad resizes the buffer to match. -->
+    <canvas id="glcanvas" width="1280" height="720" tabindex="0"></canvas>
+    <div id="overlay">
+        <h1>CRYSTAL RUSH</h1>
+        <p>loading…</p>
+        <p class="dim">click to play · WASD move · mouse look · click to shoot · Esc pause</p>
+    </div>
+
+    <!-- macroquad 0.4.15's bundle embeds the quad-net plugin with a *bare*
+         `register_plugin = …` assignment, but the bundle runs under
+         "use strict", where assigning to an undeclared name throws a
+         ReferenceError (aborting plugin registration in every browser).
+         Pre-declaring it as a global makes that assignment legal, so the
+         bundle loads cleanly AND the embedded WebSocket plugin (ws_connect,
+         ws_send, ws_try_recv) registers — which the later online phase needs. -->
+    <script>var register_plugin;</script>
+
+    <!-- miniquad/macroquad host bindings: provides the gl*, audio_*, fs_*,
+         sapp_* functions the wasm imports at runtime (the symbols that the
+         linker would otherwise call "undefined"). Must load before the wasm.
+         This bundle already embeds sapp_jsutils (js_object/get_js_object) and
+         miniquad_add_plugin. -->
+    <script src="js/mq_js_bundle.js"></script>
+
+    <!-- sapp_jsutils: defines the global js_object()/get_js_object() helpers and
+         their shared object table. The bundle embeds a *minified* copy whose
+         helpers aren't exposed under those names, so quad-storage.js (below)
+         can't reach them — we load the standalone copy to provide the globals.
+         It registers cleanly (function-declared register_plugin, no bare
+         assignment) and relies on miniquad_add_plugin + UTF8ToString from the
+         bundle, hence it must come after it. -->
+    <script src="js/sapp_jsutils.js"></script>
+
+    <!-- Persistence plugin: bridges quad-storage's host functions to the
+         browser localStorage API so the Pilot Ledger (name, settings, career)
+         survives across sessions. It does bare `params_*` assignments under
+         "use strict", so pre-declare them as globals (same fix as
+         register_plugin above). Must load after sapp_jsutils, before the wasm. -->
+    <script>var params_set_mem, params_register_js_plugin;</script>
+    <script src="js/quad-storage.js"></script>
+
+    <script>
+        // Hide the overlay shortly after the game starts drawing. miniquad has
+        // no "ready" callback, so we lift it on first user interaction or after
+        // a short delay — whichever comes first.
+        const overlay = document.getElementById("overlay");
+        function hideOverlay() {
+            if (!overlay) return;
+            overlay.style.opacity = "0";
+            setTimeout(() => overlay && overlay.remove(), 600);
+        }
+        window.addEventListener("pointerdown", hideOverlay, { once: true });
+        window.addEventListener("keydown", hideOverlay, { once: true });
+        setTimeout(hideOverlay, 4000);
+
+        // Boot the game. The .wasm filename matches the crate name; the CI/build
+        // step copies the release artifact next to this file.
+        load("crystal-rush.wasm");
+    </script>
+</body>
+</html>

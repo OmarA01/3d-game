@@ -4,6 +4,10 @@ target/
 # Compiled binary (rebuilt from source)
 crystal-rush
 
+# Web build artifact (CI rebuilds it from source; the web/ shell + JS shims are
+# committed, but the wasm is regenerated on deploy).
+web/crystal-rush.wasm
+
 # Local build hacks
 .linkstubs/
 .cargo/

@@ -187,6 +187,7 @@ pub struct TurretBlob {
 pub struct ProjBlob {
     pub pos: Vec2,
     pub vel: Vec2,
+    pub kind: u8, // 0 = turret bolt, 1 = player rocket shell
 }
 
 #[derive(Clone)]
@@ -333,6 +334,7 @@ impl Packet {
                 for p in s.projectiles.iter().take(48) {
                     w.v2(p.pos);
                     w.v2(p.vel);
+                    w.u8(p.kind);
                 }
                 w.u8(s.pickups.len() as u8);
                 for p in &s.pickups {
@@ -439,7 +441,7 @@ impl Packet {
                 let npr = r.u8()? as usize;
                 let mut projectiles = Vec::with_capacity(npr);
                 for _ in 0..npr {
-                    projectiles.push(ProjBlob { pos: r.v2()?, vel: r.v2()? });
+                    projectiles.push(ProjBlob { pos: r.v2()?, vel: r.v2()?, kind: r.u8()? });
                 }
                 let npk = r.u8()? as usize;
                 let mut pickups = Vec::with_capacity(npk);
