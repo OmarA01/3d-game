@@ -1,0 +1,10 @@
+# Keep the Docker build context small and the build hermetic. The builder stage
+# compiles from source, so none of these are needed (and target/ is huge).
+target/
+web/crystal-rush.wasm
+.git/
+.github/
+.claude/
+.linkstubs/
+crystal-rush
+*.md
