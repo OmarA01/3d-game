@@ -1,0 +1,68 @@
+name: build & release
+
+# Native Windows/Linux binaries build and attach to a GitHub Release when a
+# version tag (v*) is pushed.
+#
+# The browser (WebAssembly) build is NOT handled here. DigitalOcean App Platform
+# builds and serves it automatically on every push to main (see .do/app.yaml,
+# `deploy_on_push: true`). So there is no Pages/web job — pushing to main is the
+# web deploy trigger.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write   # upload release assets
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ------------------------------------------------------------ native (on tags)
+  # Builds runnable desktop binaries and attaches them to the GitHub Release for
+  # the pushed tag. Only runs for v* tags.
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: crystal-rush
+            asset: crystal-rush-linux-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: crystal-rush.exe
+            asset: crystal-rush-windows-x86_64.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Linux needs ALSA dev headers to link audio. (The local build uses a
+      # symlink stub in .linkstubs/, but that's a machine-specific hack and is
+      # gitignored — on CI we just install the real package.) Windows uses its
+      # own audio backend, no extra packages.
+      - name: Install ALSA (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - name: Build (release)
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "dist/${{ matrix.asset }}"
+
+      - name: Attach to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ matrix.asset }}

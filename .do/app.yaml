@@ -1,0 +1,28 @@
+# DigitalOcean App Platform spec for the Crystal Rush browser build.
+#
+# The important line is `dockerfile_path: Dockerfile`. Without it App Platform
+# autodetects the Rust buildpack (because of Cargo.toml), which builds the
+# NATIVE binary and fails to link libasound — not what we want. Setting
+# dockerfile_path forces the multi-stage Docker build that compiles the wasm
+# and serves it via nginx.
+#
+# Apply it to an EXISTING app: App → Settings → "App Spec" → Edit → paste →
+# Save (triggers a rebuild). Or create fresh: doctl apps create --spec .do/app.yaml
+name: crystal-rush
+services:
+  - name: web
+    # Force the Docker build (overrides buildpack autodetection).
+    dockerfile_path: Dockerfile
+    source_dir: /
+    github:
+      repo: OmarA01/3d-game
+      branch: main
+      deploy_on_push: true          # push to main → auto-redeploy
+    # nginx in the Dockerfile listens on 8080; tell App Platform to route there.
+    http_port: 8080
+    instance_count: 1
+    # Smallest paid instance — it's just nginx serving 4 static files. Adjust in
+    # the UI if this slug is unavailable in your region.
+    instance_size_slug: apps-s-1vcpu-0.5gb
+    routes:
+      - path: /
